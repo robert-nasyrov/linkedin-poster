@@ -296,6 +296,9 @@ async def fact_check_post(client: httpx.AsyncClient, post_text: str) -> dict:
     except Exception as e:
         logger.error(f"Fact-check error: {e}")
         return {"status": "error", "issues": [], "suggestion": f"Fact-check failed: {e}"}
+
+
+async def generate_meme_suggestion(client: httpx.AsyncClient, post_text: str) -> dict:
     """Generate a meme using free Imgflip API."""
 
     # Popular meme templates with IDs
