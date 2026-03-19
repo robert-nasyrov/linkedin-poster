@@ -399,16 +399,36 @@ async def cmd_skip(message: Message):
 
 @router.message(Command("context"))
 async def cmd_context(message: Message):
-    """Add a context note that the bot will use in future posts."""
+    """Add a context note that both LinkedIn bot and digest bot will use."""
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
     text = message.text.replace("/context", "", 1).strip()
     if not text:
         await message.answer("Usage: /context <fact or update about your life/work>")
         return
+    
+    # Save to LinkedIn bot DB
     from database import add_user_context
     await add_user_context(pool, text)
-    await message.answer(f"✅ Context saved: {text}")
+    
+    # Also save to digest bot DB (life_context table)
+    import os
+    digest_db_url = os.getenv("DIGEST_DATABASE_URL", "")
+    if digest_db_url:
+        try:
+            import asyncpg
+            conn = await asyncpg.connect(digest_db_url, timeout=10)
+            await conn.execute(
+                "INSERT INTO life_context (context, updated_at) VALUES ($1, NOW())",
+                text
+            )
+            await conn.close()
+            await message.answer(f"✅ Context saved to both bots: {text}")
+        except Exception as e:
+            logger.error(f"Failed to save to digest DB: {e}")
+            await message.answer(f"✅ Saved to LinkedIn bot. ⚠️ Digest DB error: {e}")
+    else:
+        await message.answer(f"✅ Context saved: {text}")
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_free_text(message: Message):
