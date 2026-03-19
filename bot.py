@@ -239,6 +239,27 @@ async def send_approval(chat_id: int, post_id: int, generated: dict):
             parse_mode="Markdown"
         )
 
+    # Show fact-check results
+    fact_check = generated.get("fact_check", {})
+    if fact_check and fact_check.get("status") == "issues_found":
+        issues = fact_check.get("issues", [])
+        issue_lines = []
+        for issue in issues:
+            verdict = issue.get("verdict", "?")
+            emoji = "✅" if verdict == "verified" else "⚠️" if verdict == "unverified" else "❌"
+            issue_lines.append(f"{emoji} {issue.get('claim', '?')}\n   → {issue.get('note', '')}")
+        
+        suggestion = fact_check.get("suggestion", "")
+        await bot.send_message(
+            chat_id,
+            f"🔍 *Fact Check:*\n\n"
+            + "\n\n".join(issue_lines)
+            + (f"\n\n💡 {suggestion}" if suggestion else ""),
+            parse_mode="Markdown"
+        )
+    elif fact_check and fact_check.get("status") == "clean":
+        await bot.send_message(chat_id, "✅ Fact check: all claims look clean")
+
 
 # ==================== CALLBACK HANDLERS ====================
 

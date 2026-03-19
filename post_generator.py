@@ -87,6 +87,13 @@ FORMAT 6: Meta/Transparent
 Pick the format that fits best. Default to FORMAT 1 if unsure.
 Write ONLY the post text. No labels, no meta-commentary.
 
+=== FACTUAL ACCURACY — CRITICAL ===
+- NEVER invent specific tools, apps, products, companies, or statistics
+- If you're not 100% sure something exists, describe the concept generically instead of naming it
+- "I saw apps that do X" is OK. "I used SpecificAppName which does X" is NOT OK unless you're certain it exists
+- Personal experiences and opinions don't need verification
+- When in doubt, keep it abstract: "the ecosystem" not "AppName 3.0"
+
 CRITICAL: LinkedIn does NOT support markdown. NEVER use asterisks, underscores, hash symbols, or backticks. Plain text only. Use line breaks and emoji for structure."""
 
 MEME_PROMPT = """Based on this LinkedIn post, suggest exactly ONE meme concept for supermeme.ai.
@@ -180,9 +187,10 @@ async def generate_post_from_digest(digest_text: str, pool=None) -> dict:
         data = resp.json()
         post_text = clean_post_text(data["content"][0]["text"])
 
+        fact_check = await fact_check_post(client, post_text)
         meme = await generate_meme_suggestion(client, post_text)
 
-        return {"post_text": post_text, "meme": meme}
+        return {"post_text": post_text, "meme": meme, "fact_check": fact_check}
 
 
 async def generate_post_from_topic(topic: str, pool=None) -> dict:
@@ -217,12 +225,77 @@ async def generate_post_from_topic(topic: str, pool=None) -> dict:
         data = resp.json()
         post_text = clean_post_text(data["content"][0]["text"])
 
+        # Fact-check before returning
+        fact_check = await fact_check_post(client, post_text)
+
         meme = await generate_meme_suggestion(client, post_text)
 
-        return {"post_text": post_text, "meme": meme}
+        return {"post_text": post_text, "meme": meme, "fact_check": fact_check}
 
 
-async def generate_meme_suggestion(client: httpx.AsyncClient, post_text: str) -> dict:
+async def fact_check_post(client: httpx.AsyncClient, post_text: str) -> dict:
+    """
+    Fact-check a post using Claude with web search.
+    Returns dict with verified/unverified claims and suggestions.
+    """
+    try:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "You are a fact-checker. Analyze this LinkedIn post and check ANY specific factual claims:\n"
+                            "- Named tools, apps, products, companies\n"
+                            "- Statistics or numbers\n"
+                            "- Specific events or announcements\n"
+                            "- Technical claims\n\n"
+                            "Use web search to verify each claim. Then return ONLY a JSON object:\n"
+                            '{\n'
+                            '  "status": "clean" or "issues_found",\n'
+                            '  "issues": [\n'
+                            '    {"claim": "the specific claim", "verdict": "verified" or "unverified" or "fabricated", "note": "explanation"}\n'
+                            '  ],\n'
+                            '  "suggestion": "brief suggestion if issues found, empty string if clean"\n'
+                            '}\n\n'
+                            "If the post contains only opinions, personal experiences, or general statements — return status: clean with empty issues.\n"
+                            "Return ONLY valid JSON, no markdown.\n\n"
+                            f"POST:\n{post_text}"
+                        ),
+                    }
+                ],
+            },
+            timeout=45,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        # Extract text from response (may have tool_use blocks mixed in)
+        text_parts = [b["text"] for b in data["content"] if b.get("type") == "text"]
+        raw = " ".join(text_parts).strip()
+        
+        # Try to parse JSON from response
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        # Find JSON in response
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start:end])
+        
+        return {"status": "clean", "issues": [], "suggestion": ""}
+        
+    except Exception as e:
+        logger.error(f"Fact-check error: {e}")
+        return {"status": "error", "issues": [], "suggestion": f"Fact-check failed: {e}"}
     """Generate a meme using free Imgflip API."""
 
     # Popular meme templates with IDs
