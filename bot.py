@@ -187,11 +187,14 @@ async def send_approval(chat_id: int, post_id: int, generated: dict):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Approve & Post", callback_data=f"approve:{post_id}"),
-            InlineKeyboardButton(text="🔄 Regenerate", callback_data=f"regen:{post_id}"),
+            InlineKeyboardButton(text="✅ Post + Meme", callback_data=f"approve:{post_id}"),
+            InlineKeyboardButton(text="📝 Post Text Only", callback_data=f"approvetext:{post_id}"),
         ],
         [
+            InlineKeyboardButton(text="🔄 Regenerate", callback_data=f"regen:{post_id}"),
             InlineKeyboardButton(text="✏️ Edit", callback_data=f"edit:{post_id}"),
+        ],
+        [
             InlineKeyboardButton(text="❌ Reject", callback_data=f"reject:{post_id}"),
         ],
     ])
@@ -279,6 +282,40 @@ async def cb_approve(callback: CallbackQuery):
     if result["success"]:
         await update_post_status(pool, post_id, "posted", result["post_id"])
         await callback.message.reply("✅ Posted to LinkedIn!")
+    else:
+        await update_post_status(pool, post_id, "draft")
+        await callback.message.reply(f"❌ LinkedIn error: {result['error']}")
+
+
+@router.callback_query(F.data.startswith("approvetext:"))
+async def cb_approve_text_only(callback: CallbackQuery):
+    """Post text only, no meme image."""
+    post_id = int(callback.data.split(":")[1])
+    post_data = await get_post(pool, post_id)
+    if not post_data:
+        await callback.answer("Post not found", show_alert=True)
+        return
+
+    token_data = await get_linkedin_token(pool)
+    if not token_data:
+        await callback.answer("LinkedIn not connected! Use /connect", show_alert=True)
+        return
+
+    await callback.answer("Posting text only...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    person_urn = token_data["person_urn"]
+
+    result = await post_to_linkedin(
+        token_data["access_token"],
+        person_urn,
+        post_data["post_text"],
+        image_url=None,
+    )
+
+    if result["success"]:
+        await update_post_status(pool, post_id, "posted", result["post_id"])
+        await callback.message.reply("✅ Posted to LinkedIn (text only)!")
     else:
         await update_post_status(pool, post_id, "draft")
         await callback.message.reply(f"❌ LinkedIn error: {result['error']}")

@@ -217,9 +217,27 @@ async def generate_meme_suggestion(client: httpx.AsyncClient, post_text: str) ->
         "Roll Safe Think About It": "89370399",
         "Gru's Plan": "131940431",
         "Train hitting bus": "247113703",
+        "Boardroom Meeting Suggestion": "440381756",
+        "They're The Same Picture": "180190441",
+        "Surprised Pikachu": "155067746",
+        "Panik Kalm Panik": "226297822",
+        "Monkey Puppet": "148909805",
+        "Woman Yelling At Cat": "188390779",
+        "Epic Handshake": "135256802",
+        "Bike Fall": "43601446",
+        "Bernie I Am Once Again": "91545132",
+        "Spider-Man Double": "363474466",
+        "Hide the Pain Harold": "27813981",
+        "Mocking SpongeBob": "102156234",
+        "Success Kid": "61544",
+        "Ancient Aliens": "101470",
+        "Stonks": "52223427",
+        "Sleeping Shaq": "99683372",
     }
 
-    template_list = "\n".join([f"- {name}" for name in MEME_TEMPLATES.keys()])
+    # Pick 12 random templates to show Claude — prevents always picking the same ones
+    selected = dict(random.sample(list(MEME_TEMPLATES.items()), min(12, len(MEME_TEMPLATES))))
+    template_list = "\n".join([f"- {name}" for name in selected.keys()])
 
     # Step 1: Ask Claude to pick template + write text
     try:
