@@ -25,7 +25,8 @@ async def init_db(pool):
                 digest_ids INTEGER[] DEFAULT '{}',
                 post_text TEXT NOT NULL,
                 meme_suggestion JSONB,
-                status TEXT DEFAULT 'draft',  -- draft, approved, posted, rejected
+                status TEXT DEFAULT 'draft',
+                reject_reason TEXT,
                 linkedin_post_id TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 posted_at TIMESTAMPTZ
@@ -38,6 +39,19 @@ async def init_db(pool):
                 person_urn TEXT,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS user_context (
+                id SERIAL PRIMARY KEY,
+                context_text TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        # Add columns if they don't exist (safe migration)
+        await conn.execute("""
+            DO $$ BEGIN
+                ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+            EXCEPTION WHEN others THEN NULL;
+            END $$;
         """)
 
 
@@ -125,3 +139,52 @@ async def get_linkedin_token(pool):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM linkedin_tokens WHERE id = 1")
         return dict(row) if row else None
+
+
+async def get_approved_posts(pool, limit: int = 5):
+    """Get recent approved/posted posts as positive examples."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT post_text FROM linkedin_posts
+               WHERE status IN ('posted', 'approved')
+               ORDER BY created_at DESC LIMIT $1""",
+            limit
+        )
+        return [r["post_text"] for r in rows]
+
+
+async def get_rejected_posts(pool, limit: int = 5):
+    """Get recent rejected posts with reasons as negative examples."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT post_text, reject_reason FROM linkedin_posts
+               WHERE status = 'rejected'
+               ORDER BY created_at DESC LIMIT $1""",
+            limit
+        )
+        return [{"text": r["post_text"], "reason": r["reject_reason"] or "no reason given"} for r in rows]
+
+
+async def set_reject_reason(pool, post_id: int, reason: str):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE linkedin_posts SET reject_reason = $1 WHERE id = $2",
+            reason, post_id
+        )
+
+
+async def add_user_context(pool, text: str):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_context (context_text) VALUES ($1)",
+            text
+        )
+
+
+async def get_user_context(pool, limit: int = 20):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT context_text, created_at FROM user_context ORDER BY created_at DESC LIMIT $1",
+            limit
+        )
+        return [{"text": r["context_text"], "date": r["created_at"].strftime("%Y-%m-%d")} for r in rows]

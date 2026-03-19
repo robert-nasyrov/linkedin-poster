@@ -57,6 +57,7 @@ async def cmd_start(message: Message):
         "/generate — Generate post from recent digests\n"
         "/write <topic> — Write post from your thought\n"
         "/post <text> — Post ready text directly (no AI)\n"
+        "/context <update> — Add context about your life/work\n"
         "/connect — Connect LinkedIn account\n"
         "/status — Check bot & token status\n"
         "/fetch — Fetch latest digests now\n",
@@ -125,7 +126,7 @@ async def cmd_generate(message: Message):
     await message.answer(f"🧠 Analyzing {len(digest_ids)} digests and generating post...")
 
     try:
-        generated = await generate_post_from_digest(digest_text)
+        generated = await generate_post_from_digest(digest_text, pool=pool)
         post_id = await save_post(pool, digest_ids, generated["post_text"], generated["meme"])
         await mark_digests_processed(pool, digest_ids)
         await send_approval(message.chat.id, post_id, generated)
@@ -145,7 +146,7 @@ async def cmd_write(message: Message):
 
     await message.answer("🧠 Generating post from your thought...")
     try:
-        generated = await generate_post_from_topic(topic)
+        generated = await generate_post_from_topic(topic, pool=pool)
         post_id = await save_post(pool, [], generated["post_text"], generated["meme"])
         await send_approval(message.chat.id, post_id, generated)
     except Exception as e:
@@ -333,7 +334,7 @@ async def cb_regenerate(callback: CallbackQuery):
         return
 
     try:
-        generated = await generate_post_from_topic(post_data["post_text"][:100])
+        generated = await generate_post_from_topic(post_data["post_text"][:100], pool=pool)
         await update_post_text(pool, post_id, generated["post_text"], generated.get("meme"))
         await send_approval(callback.message.chat.id, post_id, generated)
     except Exception as e:
@@ -358,26 +359,58 @@ async def cb_reject(callback: CallbackQuery):
     await update_post_status(pool, post_id, "rejected")
     await callback.answer("Post rejected")
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.reply("❌ Post rejected and archived.")
+    await callback.message.reply(
+        f"❌ Post #{post_id} rejected.\n"
+        f"💬 Why? Send a short reason so I learn (or /skip to skip)."
+    )
+    reject_states[callback.from_user.id] = post_id
 
 
-# Edit state tracking
+# State tracking
 edit_states = {}
+reject_states = {}
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_edit_text(message: Message):
+@router.message(Command("skip"))
+async def cmd_skip(message: Message):
+    if message.from_user.id in reject_states:
+        reject_states.pop(message.from_user.id)
+        await message.answer("⏭ Skipped. No feedback saved.")
+
+@router.message(Command("context"))
+async def cmd_context(message: Message):
+    """Add a context note that the bot will use in future posts."""
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
-    if message.from_user.id not in edit_states:
+    text = message.text.replace("/context", "", 1).strip()
+    if not text:
+        await message.answer("Usage: /context <fact or update about your life/work>")
+        return
+    from database import add_user_context
+    await add_user_context(pool, text)
+    await message.answer(f"✅ Context saved: {text}")
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_free_text(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
 
-    post_id = edit_states.pop(message.from_user.id)
-    new_text = message.text
+    # Handle reject reason
+    if message.from_user.id in reject_states:
+        post_id = reject_states.pop(message.from_user.id)
+        from database import set_reject_reason
+        await set_reject_reason(pool, post_id, message.text)
+        await message.answer(f"📝 Feedback saved for post #{post_id}. I'll avoid this in future posts.")
+        return
 
-    await update_post_text(pool, post_id, new_text)
-    generated = {"post_text": new_text, "meme": None}
-    await message.answer("✅ Post updated! Here's the new version:")
-    await send_approval(message.chat.id, post_id, generated)
+    # Handle edit
+    if message.from_user.id in edit_states:
+        post_id = edit_states.pop(message.from_user.id)
+        new_text = message.text
+        await update_post_text(pool, post_id, new_text)
+        generated = {"post_text": new_text, "meme": None}
+        await message.answer("✅ Post updated! Here's the new version:")
+        await send_approval(message.chat.id, post_id, generated)
+        return
 
 
 # ==================== SCHEDULER ====================
@@ -397,7 +430,7 @@ async def scheduled_post_generation():
                 result = await fetch_digests_for_post(pool)
                 if result:
                     digest_text, digest_ids = result
-                    generated = await generate_post_from_digest(digest_text)
+                    generated = await generate_post_from_digest(digest_text, pool=pool)
                     post_id = await save_post(pool, digest_ids, generated["post_text"], generated["meme"])
                     await mark_digests_processed(pool, digest_ids)
                     await send_approval(TELEGRAM_ADMIN_ID, post_id, generated)

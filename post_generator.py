@@ -117,10 +117,38 @@ def clean_post_text(text: str) -> str:
     return text.strip()
 
 
-async def generate_post_from_digest(digest_text: str) -> dict:
-    """Generate a LinkedIn post from digest content."""
+async def build_learning_context(pool) -> str:
+    """Build learning section from approved/rejected posts and user context."""
+    if not pool:
+        return ""
+
+    from database import get_approved_posts, get_rejected_posts, get_user_context
+
+    sections = []
+
+    approved = await get_approved_posts(pool, limit=5)
+    if approved:
+        examples = "\n---\n".join(approved[:3])
+        sections.append(f"=== POSTS ROBERT APPROVED (write more like these) ===\n{examples}")
+
+    rejected = await get_rejected_posts(pool, limit=5)
+    if rejected:
+        examples = "\n---\n".join([f"POST: {r['text'][:200]}...\nWHY REJECTED: {r['reason']}" for r in rejected[:3]])
+        sections.append(f"=== POSTS ROBERT REJECTED (avoid this style/tone/topic) ===\n{examples}")
+
+    ctx = await get_user_context(pool, limit=10)
+    if ctx:
+        items = "\n".join([f"- [{c['date']}] {c['text']}" for c in ctx])
+        sections.append(f"=== RECENT CONTEXT UPDATES ===\n{items}")
+
+    return "\n\n".join(sections)
+
+
+async def generate_post_from_digest(digest_text: str, pool=None) -> dict:
+    """Generate a LinkedIn post from digest content with learning."""
+    learning = await build_learning_context(pool)
+
     async with httpx.AsyncClient(timeout=60) as client:
-        # Generate post
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -137,7 +165,8 @@ async def generate_post_from_digest(digest_text: str) -> dict:
                         "role": "user",
                         "content": (
                             f"Use this format: {random.choice(FORMATS)}\n\n"
-                            f"Here is my current context — daily digests, open work items, and life situation. "
+                            + (f"{learning}\n\n" if learning else "")
+                            + f"Here is my current context — daily digests, open work items, and life situation. "
                             f"Extract something interesting and write a LinkedIn post. "
                             f"Pick a theme that connects to broader trends (AI, media, entrepreneurship, productivity). "
                             f"Remember: NEVER reveal private details, names, numbers, or clients.\n\n"
@@ -151,14 +180,15 @@ async def generate_post_from_digest(digest_text: str) -> dict:
         data = resp.json()
         post_text = clean_post_text(data["content"][0]["text"])
 
-        # Generate meme suggestion
         meme = await generate_meme_suggestion(client, post_text)
 
         return {"post_text": post_text, "meme": meme}
 
 
-async def generate_post_from_topic(topic: str) -> dict:
-    """Generate a LinkedIn post from a manual topic/thought."""
+async def generate_post_from_topic(topic: str, pool=None) -> dict:
+    """Generate a LinkedIn post from a manual topic/thought with learning."""
+    learning = await build_learning_context(pool)
+
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -174,7 +204,11 @@ async def generate_post_from_topic(topic: str) -> dict:
                 "messages": [
                     {
                         "role": "user",
-                        "content": f"Use this format: {random.choice(FORMATS)}\n\nWrite a LinkedIn post based on this thought:\n\n{topic}"
+                        "content": (
+                            f"Use this format: {random.choice(FORMATS)}\n\n"
+                            + (f"{learning}\n\n" if learning else "")
+                            + f"Write a LinkedIn post based on this thought:\n\n{topic}"
+                        )
                     }
                 ],
             },
