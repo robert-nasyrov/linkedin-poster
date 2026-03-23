@@ -208,7 +208,7 @@ async def send_approval(chat_id: int, post_id: int, generated: dict):
         parse_mode="Markdown"
     )
 
-    # Send meme image from Imgflip
+    # Send visual based on type
     if meme and meme.get("source") == "imgflip" and meme.get("image_url"):
         try:
             photo = URLInputFile(meme["image_url"])
@@ -221,22 +221,35 @@ async def send_approval(chat_id: int, post_id: int, generated: dict):
             logger.error(f"Failed to send meme image: {e}")
             await bot.send_message(
                 chat_id,
-                f"😂 *Meme:* {meme.get('template', '')}\n"
+                f"😂 Meme: {meme.get('template', '')}\n"
                 f"Top: {meme.get('text0', '')}\n"
                 f"Bottom: {meme.get('text1', '')}\n"
-                f"🔗 {meme.get('image_url', '')}",
-                parse_mode="Markdown"
+                f"🔗 {meme.get('image_url', '')}"
             )
 
-    # Fallback: text-only meme suggestion
+    elif meme and meme.get("source") == "unsplash" and meme.get("image_url"):
+        try:
+            photo = URLInputFile(meme["image_url"])
+            photographer = meme.get("photographer", "Unknown")
+            await bot.send_photo(
+                chat_id,
+                photo=photo,
+                caption=f"📷 Photo by {photographer} on Unsplash"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send Unsplash photo: {e}")
+            await bot.send_message(chat_id, f"📷 Photo: {meme.get('image_url', '')}")
+
+    elif meme and meme.get("source") == "none":
+        await bot.send_message(chat_id, "📝 Visual: text-only post (no image)")
+
     elif meme and meme.get("source") == "claude_suggestion":
         await bot.send_message(
             chat_id,
-            f"😂 *Meme suggestion:*\n"
-            f"Template: `{meme.get('template', '')}`\n"
+            f"😂 Meme suggestion:\n"
+            f"Template: {meme.get('template', '')}\n"
             f"Top: {meme.get('text0', '')}\n"
-            f"Bottom: {meme.get('text1', '')}",
-            parse_mode="Markdown"
+            f"Bottom: {meme.get('text1', '')}"
         )
 
     # Show fact-check results
@@ -289,7 +302,7 @@ async def cb_approve(callback: CallbackQuery):
     if post_data.get("meme_suggestion"):
         try:
             meme_data = json.loads(post_data["meme_suggestion"]) if isinstance(post_data["meme_suggestion"], str) else post_data["meme_suggestion"]
-            if meme_data and meme_data.get("source") in ("imgflip", "telegram_photo"):
+            if meme_data and meme_data.get("source") in ("imgflip", "telegram_photo", "unsplash"):
                 image_url = meme_data.get("image_url")
         except Exception:
             pass

@@ -37,44 +37,41 @@ async def get_digest_context() -> str:
     try:
         # Last 3 daily summaries
         summaries = await conn.fetch("""
-            SELECT summary_date, digest_text, key_items, action_items
+            SELECT date, summary, open_items
             FROM daily_summaries
-            ORDER BY summary_date DESC
+            ORDER BY date DESC
             LIMIT 3
         """)
         if summaries:
             parts = []
             for s in summaries:
-                date_str = s["summary_date"].strftime("%Y-%m-%d") if s["summary_date"] else "?"
-                text = s.get("digest_text") or ""
-                actions = s.get("action_items") or ""
+                date_str = s["date"].strftime("%Y-%m-%d") if s["date"] else "?"
+                text = s.get("summary") or ""
                 entry = f"[{date_str}]\n{text}"
-                if actions:
-                    entry += f"\nAction items: {actions}"
                 parts.append(entry)
             sections.append("=== RECENT DAILY DIGESTS ===\n" + "\n---\n".join(parts))
 
         # Open items (tasks/threads Robert is tracking)
         open_items = await conn.fetch("""
-            SELECT item_text, source, priority
+            SELECT person, what, project, days_waiting, status
             FROM open_items
             WHERE status = 'open' OR status IS NULL
-            ORDER BY priority DESC NULLS LAST
+            ORDER BY days_waiting DESC
             LIMIT 15
         """)
         if open_items:
-            items = [f"- [{r.get('priority', '?')}] {r['item_text']} (from: {r.get('source', '?')})" for r in open_items]
+            items = [f"- {r['person']}: {r['what']} ({r.get('project', '?')}, waiting {r.get('days_waiting', '?')} days)" for r in open_items]
             sections.append("=== OPEN ITEMS / ACTIVE THREADS ===\n" + "\n".join(items))
 
-        # Life context (persistent facts about Robert's situation)
+        # Life context
         life_ctx = await conn.fetch("""
-            SELECT context_key, context_value
+            SELECT context, updated_at
             FROM life_context
             ORDER BY updated_at DESC
             LIMIT 15
         """)
         if life_ctx:
-            ctx = [f"- {r['context_key']}: {r['context_value']}" for r in life_ctx]
+            ctx = [f"- {r['context']}" for r in life_ctx]
             sections.append("=== LIFE CONTEXT ===\n" + "\n".join(ctx))
 
     except Exception as e:

@@ -188,9 +188,9 @@ async def generate_post_from_digest(digest_text: str, pool=None) -> dict:
         post_text = clean_post_text(data["content"][0]["text"])
 
         fact_check = await fact_check_post(client, post_text)
-        meme = await generate_meme_suggestion(client, post_text)
+        visual = await generate_visual(client, post_text)
 
-        return {"post_text": post_text, "meme": meme, "fact_check": fact_check}
+        return {"post_text": post_text, "meme": visual, "fact_check": fact_check}
 
 
 async def generate_post_from_topic(topic: str, pool=None) -> dict:
@@ -228,9 +228,9 @@ async def generate_post_from_topic(topic: str, pool=None) -> dict:
         # Fact-check before returning
         fact_check = await fact_check_post(client, post_text)
 
-        meme = await generate_meme_suggestion(client, post_text)
+        visual = await generate_visual(client, post_text)
 
-        return {"post_text": post_text, "meme": meme, "fact_check": fact_check}
+        return {"post_text": post_text, "meme": visual, "fact_check": fact_check}
 
 
 async def fact_check_post(client: httpx.AsyncClient, post_text: str) -> dict:
@@ -296,6 +296,112 @@ async def fact_check_post(client: httpx.AsyncClient, post_text: str) -> dict:
     except Exception as e:
         logger.error(f"Fact-check error: {e}")
         return {"status": "error", "issues": [], "suggestion": f"Fact-check failed: {e}"}
+
+
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+
+
+async def generate_visual(client: httpx.AsyncClient, post_text: str) -> dict:
+    """
+    Decide visual type and generate it.
+    Types: meme (fun/ironic posts), photo (serious/professional), none (text-only)
+    """
+    # Ask Claude what visual fits best
+    try:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 200,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Analyze this LinkedIn post and decide what visual to attach.\n\n"
+                            "Return ONLY a JSON object:\n"
+                            '{"type": "meme" or "photo" or "none", "search_query": "2-4 word search for Unsplash photo if type is photo"}\n\n'
+                            "Rules:\n"
+                            "- meme: for posts with irony, humor, hot takes, or listicles\n"
+                            "- photo: for professional, serious, case study, or inspirational posts\n"
+                            "- none: for short question posts or when text speaks for itself\n"
+                            "- Vary your choices! Don't always pick the same type.\n"
+                            "Return ONLY valid JSON.\n\n"
+                            f"Post:\n{post_text}"
+                        ),
+                    }
+                ],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        decision = json.loads(cleaned[start:end])
+    except Exception as e:
+        logger.error(f"Visual type decision error: {e}")
+        decision = {"type": "meme", "search_query": ""}
+
+    visual_type = decision.get("type", "meme")
+    logger.info(f"Visual type decided: {visual_type}")
+
+    # Generate based on type
+    if visual_type == "photo" and UNSPLASH_ACCESS_KEY:
+        photo = await search_unsplash_photo(client, decision.get("search_query", "technology"))
+        if photo:
+            return photo
+
+    if visual_type == "none":
+        return {"source": "none"}
+
+    # Default to meme
+    return await generate_meme_suggestion(client, post_text)
+
+
+async def search_unsplash_photo(client: httpx.AsyncClient, query: str) -> dict:
+    """Search Unsplash for a relevant photo."""
+    try:
+        resp = await client.get(
+            "https://api.unsplash.com/search/photos",
+            params={
+                "query": query,
+                "per_page": 3,
+                "orientation": "landscape",
+            },
+            headers={
+                "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+
+        if results:
+            # Pick random from top 3
+            photo = random.choice(results[:3])
+            image_url = photo["urls"]["regular"]
+            photographer = photo["user"]["name"]
+            unsplash_link = photo["links"]["html"]
+
+            logger.info(f"Unsplash photo found: {image_url[:80]}...")
+            return {
+                "source": "unsplash",
+                "image_url": image_url,
+                "photographer": photographer,
+                "unsplash_link": unsplash_link,
+                "query": query,
+            }
+    except Exception as e:
+        logger.error(f"Unsplash search error: {e}")
+
+    return None
 
 
 async def generate_meme_suggestion(client: httpx.AsyncClient, post_text: str) -> dict:
