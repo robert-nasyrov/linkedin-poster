@@ -431,12 +431,14 @@ async def cmd_context(message: Message):
         try:
             import asyncpg
             conn = await asyncpg.connect(digest_db_url, timeout=10)
-            await conn.execute(
-                "INSERT INTO life_context (context, updated_at) VALUES ($1, NOW())",
-                text
-            )
-            await conn.close()
-            await message.answer(f"✅ Context saved to both bots: {text}")
+            try:
+                await conn.execute(
+                    "INSERT INTO life_context (context, updated_at) VALUES ($1, NOW())",
+                    text
+                )
+                await message.answer(f"✅ Context saved to both bots: {text}")
+            finally:
+                await conn.close()
         except Exception as e:
             logger.error(f"Failed to save to digest DB: {e}")
             await message.answer(f"✅ Saved to LinkedIn bot. ⚠️ Digest DB error: {e}")
