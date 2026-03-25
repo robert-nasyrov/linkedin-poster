@@ -16,8 +16,8 @@ from digest_db import save_daily_summary, save_life_context
 # КОНФИГУРАЦИЯ
 # =====================
 
-API_ID = 29829249
-API_HASH = "f6b164bf6185669159d74e027c4e33b4"
+API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -26,9 +26,9 @@ MY_USER_ID = int(os.environ.get("MY_USER_ID", "271065518"))
 # Service Account для личного календаря
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
-# OAuth для рабочего календаря (robert@karakoram.co)
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "768362429773-5dhic4s2289a6gd7gm63voercj3kl383.apps.googleusercontent.com")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "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")
+# OAuth для рабочего календаря
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
 # Календари: личный через Service Account, рабочий через OAuth
