@@ -72,7 +72,7 @@ async def find_linkedin_posts(count: int = 5, custom_topic: str = None) -> list:
     topic = custom_topic or random.choice(SEARCH_TOPICS)
     
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -82,29 +82,30 @@ async def find_linkedin_posts(count: int = 5, custom_topic: str = None) -> list:
                 },
                 json={
                     "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 1500,
+                    "max_tokens": 2000,
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages": [
                         {
                             "role": "user",
                             "content": (
                                 f"Find recent LinkedIn posts about: {topic}\n\n"
-                                f"Search for: site:linkedin.com/posts {topic}\n"
-                                f"Also try: site:linkedin.com/feed/update {topic}\n\n"
+                                f"Do multiple searches:\n"
+                                f"1. Search: {topic} site:linkedin.com after:2026-03-01\n"
+                                f"2. Search: {topic} linkedin post this week\n"
+                                f"3. Search: {topic} linkedin post March 2026\n\n"
                                 f"Requirements:\n"
-                                f"- Posts from individual people (NOT company pages, NOT ads)\n"
-                                f"- Prefer posts with engagement (comments, reactions)\n"
-                                f"- Skip posts older than a few months\n"
-                                f"- Skip generic 'top 10 AI tools' listicles\n"
-                                f"- Look for posts where someone shares personal experience with AI/automation\n\n"
-                                f"Find up to {count} posts. For each return:\n"
-                                f"- The LinkedIn post URL\n"
-                                f"- Author name and their role/title\n"
-                                f"- A brief summary (2-3 sentences)\n"
-                                f"- Approximate date if visible\n\n"
+                                f"- ONLY posts from 2026. Absolutely NO posts from 2024, 2023, or earlier.\n"
+                                f"- From individual people, NOT company pages\n"
+                                f"- If a result shows a date from 2024 or 2023, SKIP IT completely\n"
+                                f"- Better to return 1-2 fresh posts than 5 old ones\n\n"
+                                f"For each post return:\n"
+                                f"- LinkedIn URL\n"
+                                f"- Author name and role\n"
+                                f"- Summary (2-3 sentences)\n"
+                                f"- Date\n\n"
                                 f"Return ONLY a JSON array:\n"
-                                f'[{{"url": "https://linkedin.com/...", "author": "Name — Title", "summary": "What the post says", "date": "approx date or unknown"}}]\n\n'
-                                f"If you find fewer than {count}, that's fine. Return what you find. Return ONLY valid JSON."
+                                f'[{{"url": "...", "author": "Name — Role", "summary": "...", "date": "March 2026"}}]\n\n'
+                                f"If you genuinely cannot find any posts from 2026, return empty array []. Return ONLY valid JSON."
                             ),
                         }
                     ],
@@ -113,20 +114,24 @@ async def find_linkedin_posts(count: int = 5, custom_topic: str = None) -> list:
             resp.raise_for_status()
             data = resp.json()
             
-            # Extract text from response
             text_parts = [b["text"] for b in data["content"] if b.get("type") == "text"]
             raw = " ".join(text_parts).strip()
             
-            # Parse JSON
             cleaned = raw.replace("```json", "").replace("```", "").strip()
             start = cleaned.find("[")
             end = cleaned.rfind("]") + 1
             if start >= 0 and end > start:
                 posts = json.loads(cleaned[start:end])
-                # Filter to only linkedin.com URLs
-                posts = [p for p in posts if "linkedin.com" in p.get("url", "")]
-                logger.info(f"Found {len(posts)} LinkedIn posts about '{topic}'")
-                return posts[:count]
+                # Double-check: filter out obviously old posts
+                fresh = []
+                for p in posts:
+                    date = p.get("date", "").lower()
+                    if any(y in date for y in ["2022", "2023", "2024"]):
+                        continue
+                    if "linkedin.com" in p.get("url", ""):
+                        fresh.append(p)
+                logger.info(f"Found {len(fresh)} fresh LinkedIn posts about '{topic}'")
+                return fresh[:count]
             
             return []
             
