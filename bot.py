@@ -210,6 +210,7 @@ async def cmd_find(message: Message):
         url = post.get("url", "")
         author = post.get("author", "Unknown")
         summary = post.get("summary", "")[:300]
+        date = post.get("date", "")
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -218,9 +219,10 @@ async def cmd_find(message: Message):
             ],
         ])
 
+        date_line = f"\n📅 {date}" if date and date != "unknown" else ""
         await message.answer(
-            f"📌 Post {i+1}/5\n"
-            f"👤 {author}\n"
+            f"📌 Post {i+1}/{len(posts)}\n"
+            f"👤 {author}{date_line}\n"
             f"📝 {summary}\n"
             f"🔗 {url}",
             reply_markup=keyboard

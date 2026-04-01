@@ -13,22 +13,22 @@ from config import ANTHROPIC_API_KEY
 
 logger = logging.getLogger(__name__)
 
-# Topics to search for — specific and current
+# Topics to search for — broad enough to find results
 SEARCH_TOPICS = [
-    "AI automation agency 2026",
-    "built AI bot for business",
-    "Claude API production use case",
-    "solopreneur AI tools 2026",
-    "small team AI replacing hiring",
-    "AI media production workflow",
-    "Telegram bot business automation 2025 2026",
-    "no-code AI automation results",
-    "AI replacing marketing agencies",
-    "one person AI startup",
-    "AI content creation real results",
-    "building with Claude Anthropic",
-    "n8n automation business",
-    "AI operations small company",
+    "built AI automation for my business",
+    "replaced employee with AI agent",
+    "AI tools saving hours every week",
+    "solopreneur using AI to scale",
+    "small team outperforming big company with AI",
+    "AI workflow automation real results",
+    "quit my job to build AI products",
+    "AI changed how I run my company",
+    "media company using AI production",
+    "one person business AI tools",
+    "Claude Anthropic building real products",
+    "AI automation agency founder",
+    "bootstrapped startup AI tools",
+    "Telegram bot for business",
 ]
 
 # Load context for comment style
@@ -88,17 +88,23 @@ async def find_linkedin_posts(count: int = 5, custom_topic: str = None) -> list:
                         {
                             "role": "user",
                             "content": (
-                                f"Search for VERY RECENT LinkedIn posts (from the last 2 weeks only) about: {topic}\n\n"
-                                f"Use search queries like: site:linkedin.com/posts {topic}\n\n"
-                                f"CRITICAL: Only include posts from the last 14 days. Today is April 2026. Skip ANYTHING older than 2 weeks.\n"
-                                f"Look for posts with real engagement (comments, likes) from individual people, NOT company pages.\n\n"
-                                f"Find up to {count} posts. For each post return:\n"
+                                f"Find recent LinkedIn posts about: {topic}\n\n"
+                                f"Search for: site:linkedin.com/posts {topic}\n"
+                                f"Also try: site:linkedin.com/feed/update {topic}\n\n"
+                                f"Requirements:\n"
+                                f"- Posts from individual people (NOT company pages, NOT ads)\n"
+                                f"- Prefer posts with engagement (comments, reactions)\n"
+                                f"- Skip posts older than a few months\n"
+                                f"- Skip generic 'top 10 AI tools' listicles\n"
+                                f"- Look for posts where someone shares personal experience with AI/automation\n\n"
+                                f"Find up to {count} posts. For each return:\n"
                                 f"- The LinkedIn post URL\n"
-                                f"- Author name and title\n"  
-                                f"- A brief summary of what the post says (2-3 sentences)\n\n"
+                                f"- Author name and their role/title\n"
+                                f"- A brief summary (2-3 sentences)\n"
+                                f"- Approximate date if visible\n\n"
                                 f"Return ONLY a JSON array:\n"
-                                f'[{{"url": "https://linkedin.com/posts/...", "author": "Name — Title", "summary": "What the post is about"}}]\n\n'
-                                f"If you can't find recent posts, return an empty array []. Return ONLY valid JSON."
+                                f'[{{"url": "https://linkedin.com/...", "author": "Name — Title", "summary": "What the post says", "date": "approx date or unknown"}}]\n\n'
+                                f"If you find fewer than {count}, that's fine. Return what you find. Return ONLY valid JSON."
                             ),
                         }
                     ],
