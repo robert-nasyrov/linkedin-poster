@@ -13,20 +13,22 @@ from config import ANTHROPIC_API_KEY
 
 logger = logging.getLogger(__name__)
 
-# Topics to search for
+# Topics to search for — specific and current
 SEARCH_TOPICS = [
-    "AI automation small business",
-    "AI tools media company",
-    "Telegram bot business automation",
-    "solopreneur AI tools",
-    "media startup Central Asia",
-    "AI replacing agencies",
-    "small team AI productivity",
-    "AI content creation workflow",
-    "no-code AI automation",
-    "building AI systems without coding",
-    "Claude API real use cases",
-    "AI for media operations",
+    "AI automation agency 2026",
+    "built AI bot for business",
+    "Claude API production use case",
+    "solopreneur AI tools 2026",
+    "small team AI replacing hiring",
+    "AI media production workflow",
+    "Telegram bot business automation 2025 2026",
+    "no-code AI automation results",
+    "AI replacing marketing agencies",
+    "one person AI startup",
+    "AI content creation real results",
+    "building with Claude Anthropic",
+    "n8n automation business",
+    "AI operations small company",
 ]
 
 # Load context for comment style
@@ -65,9 +67,9 @@ EXAMPLES OF GOOD COMMENTS:
 Write ONLY the comment text. No quotes, no labels."""
 
 
-async def find_linkedin_posts(count: int = 5) -> list:
+async def find_linkedin_posts(count: int = 5, custom_topic: str = None) -> list:
     """Search for relevant LinkedIn posts using Claude web search."""
-    topic = random.choice(SEARCH_TOPICS)
+    topic = custom_topic or random.choice(SEARCH_TOPICS)
     
     try:
         async with httpx.AsyncClient(timeout=45) as client:
@@ -86,15 +88,17 @@ async def find_linkedin_posts(count: int = 5) -> list:
                         {
                             "role": "user",
                             "content": (
-                                f"Search for recent LinkedIn posts about: {topic}\n\n"
-                                f"Use search query: site:linkedin.com/posts {topic}\n\n"
-                                f"Find {count} recent posts. For each post return:\n"
+                                f"Search for RECENT LinkedIn posts (from the last 30 days, 2026) about: {topic}\n\n"
+                                f"Use search queries like: site:linkedin.com/posts {topic} 2026\n\n"
+                                f"CRITICAL: Only include posts from 2025-2026. Skip anything older.\n"
+                                f"Look for posts with real engagement (comments, likes) from individual people, NOT company pages.\n\n"
+                                f"Find up to {count} posts. For each post return:\n"
                                 f"- The LinkedIn post URL\n"
-                                f"- Author name\n"
+                                f"- Author name and title\n"  
                                 f"- A brief summary of what the post says (2-3 sentences)\n\n"
                                 f"Return ONLY a JSON array:\n"
-                                f'[{{"url": "https://linkedin.com/posts/...", "author": "Name", "summary": "What the post is about"}}]\n\n'
-                                f"Return ONLY valid JSON, no markdown."
+                                f'[{{"url": "https://linkedin.com/posts/...", "author": "Name — Title", "summary": "What the post is about"}}]\n\n'
+                                f"If you can't find recent posts, return an empty array []. Return ONLY valid JSON."
                             ),
                         }
                     ],

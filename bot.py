@@ -194,9 +194,14 @@ async def cmd_find(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
 
-    await message.answer("🔍 Searching for relevant LinkedIn posts...")
+    custom_topic = (message.text or "").replace("/find", "", 1).strip()
+    
+    if custom_topic:
+        await message.answer(f"🔍 Searching LinkedIn for: {custom_topic}...")
+    else:
+        await message.answer("🔍 Searching for relevant LinkedIn posts...")
 
-    posts = await find_linkedin_posts(count=5)
+    posts = await find_linkedin_posts(count=5, custom_topic=custom_topic or None)
     if not posts:
         await message.answer("❌ No posts found. Try again later.")
         return
