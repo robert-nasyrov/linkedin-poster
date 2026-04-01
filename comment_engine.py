@@ -88,9 +88,9 @@ async def find_linkedin_posts(count: int = 5, custom_topic: str = None) -> list:
                         {
                             "role": "user",
                             "content": (
-                                f"Search for RECENT LinkedIn posts (from the last 30 days, 2026) about: {topic}\n\n"
-                                f"Use search queries like: site:linkedin.com/posts {topic} 2026\n\n"
-                                f"CRITICAL: Only include posts from 2025-2026. Skip anything older.\n"
+                                f"Search for VERY RECENT LinkedIn posts (from the last 2 weeks only) about: {topic}\n\n"
+                                f"Use search queries like: site:linkedin.com/posts {topic}\n\n"
+                                f"CRITICAL: Only include posts from the last 14 days. Today is April 2026. Skip ANYTHING older than 2 weeks.\n"
                                 f"Look for posts with real engagement (comments, likes) from individual people, NOT company pages.\n\n"
                                 f"Find up to {count} posts. For each post return:\n"
                                 f"- The LinkedIn post URL\n"
