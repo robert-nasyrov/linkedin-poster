@@ -33,6 +33,7 @@ from post_generator import generate_post_from_digest, generate_post_from_topic
 from linkedin_api import (
     get_auth_url, exchange_code, post_to_linkedin, check_token_valid,
 )
+from comment_engine import find_linkedin_posts, generate_comment, generate_comment_from_url
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,10 +54,14 @@ async def cmd_start(message: Message):
         return
     await message.answer(
         "🚀 *LinkedIn Auto-Poster Bot*\n\n"
-        "Commands:\n"
+        "Posts:\n"
         "/generate — Generate post from recent digests\n"
         "/write <topic> — Write post from your thought\n"
-        "/post <text> — Post ready text directly (no AI)\n"
+        "/post <text> — Post ready text directly (no AI)\n\n"
+        "Comments:\n"
+        "/find — Find posts to comment on\n"
+        "/comment <url> — Generate comment for a post\n\n"
+        "Settings:\n"
         "/context <update> — Add context about your life/work\n"
         "/connect — Connect LinkedIn account\n"
         "/status — Check bot & token status\n"
@@ -179,6 +184,214 @@ async def cmd_post(message: Message):
     post_id = await save_post(pool, [], text, meme_data)
     generated = {"post_text": text, "meme": meme_data}
     await send_approval(message.chat.id, post_id, generated)
+
+
+# ==================== COMMENT COMMANDS ====================
+
+@router.message(Command("find"))
+async def cmd_find(message: Message):
+    """Find relevant LinkedIn posts to comment on."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    await message.answer("🔍 Searching for relevant LinkedIn posts...")
+
+    posts = await find_linkedin_posts(count=5)
+    if not posts:
+        await message.answer("❌ No posts found. Try again later.")
+        return
+
+    for i, post in enumerate(posts):
+        url = post.get("url", "")
+        author = post.get("author", "Unknown")
+        summary = post.get("summary", "")[:300]
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💬 Generate Comment", callback_data=f"gencomment:{i}"),
+                InlineKeyboardButton(text="⏭ Skip", callback_data=f"skippost:{i}"),
+            ],
+        ])
+
+        await message.answer(
+            f"📌 Post {i+1}/5\n"
+            f"👤 {author}\n"
+            f"📝 {summary}\n"
+            f"🔗 {url}",
+            reply_markup=keyboard
+        )
+
+    # Store posts in memory for callback handlers
+    found_posts_cache[message.from_user.id] = posts
+
+
+@router.message(Command("comment"))
+async def cmd_comment(message: Message):
+    """Generate a comment for a specific LinkedIn post URL."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    text = (message.text or "").replace("/comment", "", 1).strip()
+    if not text or "linkedin.com" not in text:
+        await message.answer("Usage: /comment <linkedin post URL>")
+        return
+
+    await message.answer("🧠 Reading post and generating comment...")
+
+    result = await generate_comment_from_url(text)
+    comment_text = result.get("comment", "")
+    summary = result.get("summary", "")
+
+    if not comment_text:
+        await message.answer("❌ Could not generate comment. Try a different URL.")
+        return
+
+    # Store for approval
+    pending_comments[message.from_user.id] = {
+        "url": text,
+        "comment": comment_text,
+        "summary": summary,
+    }
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Post Comment", callback_data="postcomment"),
+            InlineKeyboardButton(text="🔄 Regenerate", callback_data="regencomment"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Edit", callback_data="editcomment"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancelcomment"),
+        ],
+    ])
+
+    await message.answer(
+        f"📌 Post: {summary[:200]}\n\n"
+        f"💬 Comment:\n{comment_text}",
+        reply_markup=keyboard
+    )
+
+
+# Comment state storage
+found_posts_cache = {}
+pending_comments = {}
+
+
+@router.callback_query(F.data.startswith("gencomment:"))
+async def cb_gen_comment(callback: CallbackQuery):
+    """Generate comment for a found post."""
+    idx = int(callback.data.split(":")[1])
+    posts = found_posts_cache.get(callback.from_user.id, [])
+    if idx >= len(posts):
+        await callback.answer("Post not found", show_alert=True)
+        return
+
+    post = posts[idx]
+    await callback.answer("Generating comment...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    comment_text = await generate_comment(post["url"], post["summary"])
+    if not comment_text:
+        await callback.message.reply("❌ Could not generate comment.")
+        return
+
+    pending_comments[callback.from_user.id] = {
+        "url": post["url"],
+        "comment": comment_text,
+        "summary": post["summary"],
+    }
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Post Comment", callback_data="postcomment"),
+            InlineKeyboardButton(text="🔄 Regenerate", callback_data="regencomment"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Edit", callback_data="editcomment"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancelcomment"),
+        ],
+    ])
+
+    await callback.message.reply(
+        f"💬 Comment for {post.get('author', 'Unknown')}:\n\n{comment_text}",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data == "postcomment")
+async def cb_post_comment(callback: CallbackQuery):
+    """Post the approved comment."""
+    pending = pending_comments.pop(callback.from_user.id, None)
+    if not pending:
+        await callback.answer("No pending comment", show_alert=True)
+        return
+
+    await callback.answer("Comment noted!")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    # For now, copy comment to clipboard — LinkedIn comment API needs post URN
+    # which we can't easily extract from URL without scraping
+    await callback.message.reply(
+        f"✅ Comment ready! Copy and paste on LinkedIn:\n\n"
+        f"💬 {pending['comment']}\n\n"
+        f"🔗 {pending['url']}"
+    )
+
+
+@router.callback_query(F.data == "regencomment")
+async def cb_regen_comment(callback: CallbackQuery):
+    """Regenerate the comment."""
+    pending = pending_comments.get(callback.from_user.id)
+    if not pending:
+        await callback.answer("No pending comment", show_alert=True)
+        return
+
+    await callback.answer("Regenerating...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    comment_text = await generate_comment(pending["url"], pending["summary"])
+    if not comment_text:
+        await callback.message.reply("❌ Could not regenerate.")
+        return
+
+    pending_comments[callback.from_user.id]["comment"] = comment_text
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Post Comment", callback_data="postcomment"),
+            InlineKeyboardButton(text="🔄 Regenerate", callback_data="regencomment"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Edit", callback_data="editcomment"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancelcomment"),
+        ],
+    ])
+
+    await callback.message.reply(
+        f"💬 New comment:\n\n{comment_text}",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data == "editcomment")
+async def cb_edit_comment(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply("✏️ Send me the edited comment text.")
+    edit_states[callback.from_user.id] = "comment"
+
+
+@router.callback_query(F.data == "cancelcomment")
+async def cb_cancel_comment(callback: CallbackQuery):
+    pending_comments.pop(callback.from_user.id, None)
+    await callback.answer("Cancelled")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply("❌ Comment cancelled.")
+
+
+@router.callback_query(F.data.startswith("skippost:"))
+async def cb_skip_post(callback: CallbackQuery):
+    await callback.answer("Skipped")
+    await callback.message.edit_reply_markup(reply_markup=None)
 
 
 async def send_approval(chat_id: int, post_id: int, generated: dict):
@@ -431,14 +644,12 @@ async def cmd_context(message: Message):
         try:
             import asyncpg
             conn = await asyncpg.connect(digest_db_url, timeout=10)
-            try:
-                await conn.execute(
-                    "INSERT INTO life_context (context, updated_at) VALUES ($1, NOW())",
-                    text
-                )
-                await message.answer(f"✅ Context saved to both bots: {text}")
-            finally:
-                await conn.close()
+            await conn.execute(
+                "INSERT INTO life_context (context, updated_at) VALUES ($1, NOW())",
+                text
+            )
+            await conn.close()
+            await message.answer(f"✅ Context saved to both bots: {text}")
         except Exception as e:
             logger.error(f"Failed to save to digest DB: {e}")
             await message.answer(f"✅ Saved to LinkedIn bot. ⚠️ Digest DB error: {e}")
@@ -460,8 +671,27 @@ async def handle_free_text(message: Message):
 
     # Handle edit
     if message.from_user.id in edit_states:
-        post_id = edit_states.pop(message.from_user.id)
+        state = edit_states.pop(message.from_user.id)
         new_text = message.text
+
+        # Comment edit
+        if state == "comment":
+            if message.from_user.id in pending_comments:
+                pending_comments[message.from_user.id]["comment"] = new_text
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Post Comment", callback_data="postcomment"),
+                        InlineKeyboardButton(text="❌ Cancel", callback_data="cancelcomment"),
+                    ],
+                ])
+                await message.answer(
+                    f"✅ Comment updated:\n\n💬 {new_text}",
+                    reply_markup=keyboard
+                )
+            return
+
+        # Post edit
+        post_id = state
         await update_post_text(pool, post_id, new_text)
         generated = {"post_text": new_text, "meme": None}
         await message.answer("✅ Post updated! Here's the new version:")
