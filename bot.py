@@ -889,14 +889,21 @@ async def handle_linkedin_callback(request):
 
 async def handle_threads_callback(request):
     """Handle Threads OAuth callback."""
+    logger.info(f"Threads callback hit! Query: {dict(request.query)}")
     code = request.query.get("code")
     error = request.query.get("error")
+    error_reason = request.query.get("error_reason", "")
+    error_description = request.query.get("error_description", "")
 
     if error:
-        return web.Response(text=f"Threads auth error: {error}", status=400)
+        logger.error(f"Threads auth error: {error} - {error_reason} - {error_description}")
+        return web.Response(text=f"Threads auth error: {error} - {error_description}", status=400)
 
     if not code:
         return web.Response(text="No code provided", status=400)
+
+    # Threads sometimes appends #_ to the code
+    code = code.replace("#_", "").strip()
 
     try:
         token_data = await exchange_threads_code(code)

@@ -27,7 +27,7 @@ def get_threads_auth_url() -> str:
         "scope": "threads_basic,threads_content_publish",
         "response_type": "code",
     }
-    return f"https://threads.net/oauth/authorize?{urlencode(params)}"
+    return f"https://www.threads.net/oauth/authorize?{urlencode(params)}"
 
 
 async def exchange_threads_code(code: str) -> dict:
