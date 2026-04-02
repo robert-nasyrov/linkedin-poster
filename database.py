@@ -45,6 +45,14 @@ async def init_db(pool):
                 context_text TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS threads_tokens (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                access_token TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                expires_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
         """)
         # Add columns if they don't exist (safe migration)
         await conn.execute("""
@@ -188,3 +196,22 @@ async def get_user_context(pool, limit: int = 20):
             limit
         )
         return [{"text": r["context_text"], "date": r["created_at"].strftime("%Y-%m-%d")} for r in rows]
+
+
+async def save_threads_token(pool, access_token: str, user_id: str, expires_in: int = 5184000):
+    from datetime import timedelta
+    expires_at = datetime.now() + timedelta(seconds=expires_in)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO threads_tokens (id, access_token, user_id, expires_at, updated_at)
+               VALUES (1, $1, $2, $3, NOW())
+               ON CONFLICT (id) DO UPDATE
+               SET access_token = $1, user_id = $2, expires_at = $3, updated_at = NOW()""",
+            access_token, user_id, expires_at
+        )
+
+
+async def get_threads_token(pool):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM threads_tokens WHERE id = 1")
+        return dict(row) if row else None

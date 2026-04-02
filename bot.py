@@ -27,6 +27,7 @@ from database import (
     get_pool, init_db, save_post, update_post_status,
     update_post_text, get_post, mark_digests_processed,
     save_linkedin_token, get_linkedin_token,
+    save_threads_token, get_threads_token,
 )
 from digest_reader import fetch_recent_digests, fetch_digests_for_post
 from post_generator import generate_post_from_digest, generate_post_from_topic
@@ -34,6 +35,9 @@ from linkedin_api import (
     get_auth_url, exchange_code, post_to_linkedin, check_token_valid,
 )
 from comment_engine import find_linkedin_posts, generate_comment, generate_comment_from_url
+from threads_api import (
+    get_threads_auth_url, exchange_threads_code, post_to_threads, adapt_post_for_threads,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,7 +57,7 @@ async def cmd_start(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
     await message.answer(
-        "🚀 *LinkedIn Auto-Poster Bot*\n\n"
+        "🚀 *LinkedIn + Threads Auto-Poster Bot*\n\n"
         "Posts:\n"
         "/generate — Generate post from recent digests\n"
         "/write <topic> — Write post from your thought\n"
@@ -64,6 +68,7 @@ async def cmd_start(message: Message):
         "Settings:\n"
         "/context <update> — Add context about your life/work\n"
         "/connect — Connect LinkedIn account\n"
+        "/threads — Connect Threads account\n"
         "/status — Check bot & token status\n"
         "/fetch — Fetch latest digests now\n",
         parse_mode="Markdown"
@@ -84,25 +89,43 @@ async def cmd_connect(message: Message):
     )
 
 
+@router.message(Command("threads"))
+async def cmd_threads(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    url = get_threads_auth_url()
+    await message.answer(
+        f"🧵 Click to connect Threads:\n\n{url}\n\n"
+        "After authorizing, the token will be saved automatically.",
+    )
+
+
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
     token_data = await get_linkedin_token(pool)
+    threads_data = await get_threads_token(pool)
+    
+    lines = ["*Bot Status*\n"]
+    
     if token_data:
         valid = await check_token_valid(token_data["access_token"])
         expires = token_data["expires_at"].strftime("%Y-%m-%d")
         status = "✅ Valid" if valid else "❌ Expired"
-        await message.answer(
-            f"*Bot Status*\n\n"
-            f"LinkedIn: {status}\n"
-            f"Token expires: {expires}\n"
-            f"Person URN: `{token_data['person_urn']}`\n"
-            f"Schedule: days {POST_DAYS}, hour {POST_HOUR}:00 UZT",
-            parse_mode="Markdown"
-        )
+        lines.append(f"LinkedIn: {status} (expires {expires})")
     else:
-        await message.answer("LinkedIn: ❌ Not connected\nUse /connect to set up")
+        lines.append("LinkedIn: ❌ Not connected (/connect)")
+    
+    if threads_data:
+        expires = threads_data["expires_at"].strftime("%Y-%m-%d") if threads_data.get("expires_at") else "?"
+        lines.append(f"Threads: ✅ Connected (expires {expires})")
+    else:
+        lines.append("Threads: ❌ Not connected (/threads)")
+    
+    lines.append(f"\nSchedule: days {POST_DAYS}, hour {POST_HOUR}:00 UZT")
+    
+    await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
 @router.message(Command("fetch"))
@@ -536,7 +559,14 @@ async def cb_approve(callback: CallbackQuery):
 
     if result["success"]:
         await update_post_status(pool, post_id, "posted", result["post_id"])
-        await callback.message.reply("✅ Posted to LinkedIn!")
+        threads_data = await get_threads_token(pool)
+        if threads_data:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧵 Also post to Threads", callback_data=f"threads:{post_id}")],
+            ])
+            await callback.message.reply("✅ Posted to LinkedIn!", reply_markup=keyboard)
+        else:
+            await callback.message.reply("✅ Posted to LinkedIn!")
     else:
         await update_post_status(pool, post_id, "draft")
         await callback.message.reply(f"❌ LinkedIn error: {result['error']}")
@@ -570,10 +600,92 @@ async def cb_approve_text_only(callback: CallbackQuery):
 
     if result["success"]:
         await update_post_status(pool, post_id, "posted", result["post_id"])
-        await callback.message.reply("✅ Posted to LinkedIn (text only)!")
+        threads_data = await get_threads_token(pool)
+        if threads_data:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧵 Also post to Threads", callback_data=f"threads:{post_id}")],
+            ])
+            await callback.message.reply("✅ Posted to LinkedIn (text only)!", reply_markup=keyboard)
+        else:
+            await callback.message.reply("✅ Posted to LinkedIn (text only)!")
     else:
         await update_post_status(pool, post_id, "draft")
         await callback.message.reply(f"❌ LinkedIn error: {result['error']}")
+
+
+@router.callback_query(F.data.startswith("threads:"))
+async def cb_post_to_threads(callback: CallbackQuery):
+    """Adapt and post to Threads."""
+    post_id = int(callback.data.split(":")[1])
+    post_data = await get_post(pool, post_id)
+    if not post_data:
+        await callback.answer("Post not found", show_alert=True)
+        return
+
+    threads_data = await get_threads_token(pool)
+    if not threads_data:
+        await callback.answer("Threads not connected! Use /threads", show_alert=True)
+        return
+
+    await callback.answer("Adapting for Threads...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    # Adapt post for Threads format
+    threads_text = await adapt_post_for_threads(post_data["post_text"])
+
+    # Show preview before posting
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Post to Threads", callback_data=f"threadsconfirm:{post_id}"),
+            InlineKeyboardButton(text="❌ Skip", callback_data="cancelcomment"),
+        ],
+    ])
+
+    # Store adapted text
+    pending_threads[callback.from_user.id] = {
+        "post_id": post_id,
+        "text": threads_text,
+    }
+
+    await callback.message.reply(
+        f"🧵 Threads version ({len(threads_text)} chars):\n\n{threads_text}",
+        reply_markup=keyboard
+    )
+
+
+# Threads state
+pending_threads = {}
+
+
+@router.callback_query(F.data.startswith("threadsconfirm:"))
+async def cb_confirm_threads(callback: CallbackQuery):
+    """Publish to Threads."""
+    pending = pending_threads.pop(callback.from_user.id, None)
+    if not pending:
+        await callback.answer("No pending Threads post", show_alert=True)
+        return
+
+    threads_data = await get_threads_token(pool)
+    if not threads_data:
+        await callback.answer("Threads not connected!", show_alert=True)
+        return
+
+    await callback.answer("Posting to Threads...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    try:
+        result = await post_to_threads(
+            threads_data["access_token"],
+            threads_data["user_id"],
+            pending["text"],
+        )
+        if result.get("success"):
+            await callback.message.reply(f"🧵 Posted to Threads! ID: {result['post_id']}")
+        else:
+            await callback.message.reply(f"❌ Threads error: {result}")
+    except Exception as e:
+        logger.error(f"Threads post error: {e}")
+        await callback.message.reply(f"❌ Threads error: {e}")
 
 
 @router.callback_query(F.data.startswith("regen:"))
@@ -775,6 +887,39 @@ async def handle_linkedin_callback(request):
         return web.Response(text=f"Error: {e}", status=500)
 
 
+async def handle_threads_callback(request):
+    """Handle Threads OAuth callback."""
+    code = request.query.get("code")
+    error = request.query.get("error")
+
+    if error:
+        return web.Response(text=f"Threads auth error: {error}", status=400)
+
+    if not code:
+        return web.Response(text="No code provided", status=400)
+
+    try:
+        token_data = await exchange_threads_code(code)
+        await save_threads_token(
+            pool,
+            token_data["access_token"],
+            token_data["user_id"],
+            token_data.get("expires_in", 5184000),
+        )
+        await bot.send_message(
+            TELEGRAM_ADMIN_ID,
+            f"🧵 Threads connected!\nUser ID: `{token_data['user_id']}`",
+            parse_mode="Markdown"
+        )
+        return web.Response(
+            text="<h1>🧵 Threads Connected!</h1><p>Go back to Telegram.</p>",
+            content_type="text/html"
+        )
+    except Exception as e:
+        logger.error(f"Threads OAuth error: {e}")
+        return web.Response(text=f"Error: {e}", status=500)
+
+
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -792,6 +937,7 @@ async def main():
     # Start web server for OAuth callback
     app = web.Application()
     app.router.add_get("/linkedin/callback", handle_linkedin_callback)
+    app.router.add_get("/threads/callback", handle_threads_callback)
     app.router.add_get("/health", health_check)
 
     runner = web.AppRunner(app)
