@@ -208,7 +208,7 @@ async def generate_threads_content(topic: str) -> dict:
                                 "- Part 1: HOOK. Must make people stop scrolling. Curiosity gap or bold claim.\n"
                                 "  End with something that makes them tap to read more.\n"
                                 "- Parts 2-7: STORY/VALUE. Each part max 480 chars. Each must stand alone AND connect.\n"
-                                "  Use 1/N, 2/N format at the start of each part.\n"
+                                "  Do NOT number the parts (no 1/6, 2/6 etc). Let each part flow naturally.\n"
                                 "- Last part: CTA or punchline. Question, takeaway, or call to action.\n\n"
                                 "STYLE:\n"
                                 "- Casual, direct, like texting a smart friend\n"
