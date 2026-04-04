@@ -54,7 +54,8 @@ pool = None
 async def get_threads_token_or_env(pool):
     """Get Threads token from DB, fallback to env vars."""
     import os
-    data = await get_threads_token_or_env(pool)
+    from database import get_threads_token as _get_threads_token_db
+    data = await _get_threads_token_db(pool)
     if data:
         return data
     token = os.getenv("THREADS_ACCESS_TOKEN", "")
