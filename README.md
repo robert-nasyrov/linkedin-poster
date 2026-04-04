@@ -41,4 +41,4 @@ The system maintains a database of approved and rejected posts. Each new generat
 
 ## Context injection
 
-A living profile document (`robert_context.md`) is injected into the system prompt, giving Claude full context about the author's background, projects, tone, and current priorities. This ensures posts feel authentic rather than generic.
+A living profile document is injected into the system prompt, giving Claude full context about the author's background, projects, tone, and current priorities. This ensures posts feel authentic rather than generic. The context file is excluded from the repo for privacy.
