@@ -82,7 +82,7 @@ async def post_to_threads(access_token: str, user_id: str, text: str) -> dict:
             f"{GRAPH_API_BASE}/v1.0/{user_id}/threads",
             params={
                 "media_type": "TEXT",
-                "text": text[:500],  # Threads limit
+                "text": text[:500],
                 "access_token": access_token,
             },
         )
@@ -91,7 +91,6 @@ async def post_to_threads(access_token: str, user_id: str, text: str) -> dict:
 
         logger.info(f"Created Threads container: {container_id}")
 
-        # Wait a moment for processing
         import asyncio
         await asyncio.sleep(3)
 
@@ -108,6 +107,141 @@ async def post_to_threads(access_token: str, user_id: str, text: str) -> dict:
 
         logger.info(f"Published to Threads: {post_id}")
         return {"success": True, "post_id": post_id}
+
+
+async def post_reply_to_threads(access_token: str, user_id: str, text: str, reply_to_id: str) -> dict:
+    """Post a reply to an existing Threads post (for thread chains)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{GRAPH_API_BASE}/v1.0/{user_id}/threads",
+            params={
+                "media_type": "TEXT",
+                "text": text[:500],
+                "reply_to_id": reply_to_id,
+                "access_token": access_token,
+            },
+        )
+        resp.raise_for_status()
+        container_id = resp.json()["id"]
+
+        import asyncio
+        await asyncio.sleep(3)
+
+        resp2 = await client.post(
+            f"{GRAPH_API_BASE}/v1.0/{user_id}/threads_publish",
+            params={
+                "creation_id": container_id,
+                "access_token": access_token,
+            },
+        )
+        resp2.raise_for_status()
+        post_id = resp2.json()["id"]
+
+        logger.info(f"Published reply to Threads: {post_id}")
+        return {"success": True, "post_id": post_id}
+
+
+async def post_thread_chain(access_token: str, user_id: str, parts: list) -> dict:
+    """Post a multi-part thread: first post + replies."""
+    if not parts:
+        return {"success": False, "error": "No parts"}
+
+    # Post first part
+    result = await post_to_threads(access_token, user_id, parts[0])
+    if not result.get("success"):
+        return result
+
+    import asyncio
+    last_id = result["post_id"]
+    posted_ids = [last_id]
+
+    # Post replies
+    for part in parts[1:]:
+        await asyncio.sleep(2)
+        try:
+            reply = await post_reply_to_threads(access_token, user_id, part, last_id)
+            if reply.get("success"):
+                last_id = reply["post_id"]
+                posted_ids.append(last_id)
+            else:
+                logger.error(f"Reply failed: {reply}")
+                break
+        except Exception as e:
+            logger.error(f"Thread chain error: {e}")
+            break
+
+    return {"success": True, "post_ids": posted_ids, "count": len(posted_ids)}
+
+
+async def generate_threads_content(topic: str) -> dict:
+    """
+    Generate Threads-native content. Claude decides format:
+    - Single post (hot take, question)
+    - Multi-part thread (story, tutorial, list)
+    """
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 2000,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "You write Threads posts for Robert — an AI automation engineer "
+                                "who builds bots and systems for media companies in Central Asia.\n\n"
+                                "Generate a Threads post or thread about this topic:\n"
+                                f"{topic}\n\n"
+                                "DECIDE THE FORMAT:\n"
+                                "- If it's a hot take, opinion, or question → single post (max 480 chars)\n"
+                                "- If it's a story, tutorial, breakdown, or list → multi-part thread (3-8 parts)\n\n"
+                                "THREAD FORMAT RULES:\n"
+                                "- Part 1: HOOK. Must make people stop scrolling. Curiosity gap or bold claim.\n"
+                                "  End with something that makes them tap to read more.\n"
+                                "- Parts 2-7: STORY/VALUE. Each part max 480 chars. Each must stand alone AND connect.\n"
+                                "  Use 1/N, 2/N format at the start of each part.\n"
+                                "- Last part: CTA or punchline. Question, takeaway, or call to action.\n\n"
+                                "STYLE:\n"
+                                "- Casual, direct, like texting a smart friend\n"
+                                "- No hashtags in thread parts (only last part, max 2)\n"
+                                "- No emojis overload, no markdown\n"
+                                "- Short sentences. Line breaks between thoughts.\n"
+                                "- English only\n"
+                                "- Real experiences > generic advice\n\n"
+                                "Return ONLY a JSON object:\n"
+                                '{"format": "single" or "thread", "parts": ["part1 text", "part2 text", ...]}\n\n'
+                                "For single posts, parts array has 1 item.\n"
+                                "Return ONLY valid JSON."
+                            ),
+                        }
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            raw = resp.json()["content"][0]["text"].strip()
+            cleaned = raw.replace("```json", "").replace("```", "").strip()
+            start = cleaned.find("{")
+            end = cleaned.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = json.loads(cleaned[start:end])
+                # Ensure all parts under 500 chars
+                result["parts"] = [p[:497] + "..." if len(p) > 500 else p for p in result["parts"]]
+                return result
+
+            return {"format": "single", "parts": [topic[:480]]}
+
+    except Exception as e:
+        logger.error(f"Threads generation error: {e}")
+        return {"format": "single", "parts": [topic[:480]]}
 
 
 async def adapt_post_for_threads(linkedin_text: str) -> str:

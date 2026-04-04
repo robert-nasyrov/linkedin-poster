@@ -36,7 +36,8 @@ from linkedin_api import (
 )
 from comment_engine import find_linkedin_posts, generate_comment, generate_comment_from_url
 from threads_api import (
-    get_threads_auth_url, exchange_threads_code, post_to_threads, adapt_post_for_threads,
+    get_threads_auth_url, exchange_threads_code, post_to_threads,
+    adapt_post_for_threads, generate_threads_content, post_thread_chain,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -74,6 +75,7 @@ async def cmd_start(message: Message):
         "Posts:\n"
         "/generate — Generate post from recent digests\n"
         "/write <topic> — Write post from your thought\n"
+        "/twrite <topic> — Write for Threads (thread chains)\n"
         "/post <text> — Post ready text directly (no AI)\n\n"
         "Comments:\n"
         "/find — Find posts to comment on\n"
@@ -312,6 +314,167 @@ async def cmd_comment(message: Message):
         f"💬 Comment:\n{comment_text}",
         reply_markup=keyboard
     )
+
+
+# ==================== THREADS COMMANDS ====================
+
+@router.message(Command("twrite"))
+async def cmd_twrite(message: Message):
+    """Generate Threads-native content (single post or thread chain)."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    topic = (message.text or "").replace("/twrite", "", 1).strip()
+    if not topic:
+        await message.answer("Usage: /twrite <topic or thought>")
+        return
+
+    threads_data = await get_threads_token_or_env(pool)
+    if not threads_data:
+        await message.answer("❌ Threads not connected. Use /threads or set THREADS_ACCESS_TOKEN")
+        return
+
+    await message.answer("🧵 Generating Threads content...")
+
+    content = await generate_threads_content(topic)
+    parts = content.get("parts", [])
+    fmt = content.get("format", "single")
+
+    if not parts:
+        await message.answer("❌ Failed to generate content.")
+        return
+
+    # Store for approval
+    pending_threads_content[message.from_user.id] = {
+        "parts": parts,
+        "format": fmt,
+    }
+
+    # Show preview
+    if fmt == "thread" and len(parts) > 1:
+        preview = "\n\n---\n\n".join(parts)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🧵 Post Thread ({len(parts)} parts)", callback_data="postthread"),
+                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread"),
+            ],
+        ])
+        await message.answer(
+            f"🧵 Thread ({len(parts)} parts):\n\n{preview}",
+            reply_markup=keyboard
+        )
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🧵 Post to Threads", callback_data="postthread"),
+                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread"),
+            ],
+        ])
+        await message.answer(
+            f"🧵 Single post ({len(parts[0])} chars):\n\n{parts[0]}",
+            reply_markup=keyboard
+        )
+
+
+pending_threads_content = {}
+
+
+@router.callback_query(F.data == "postthread")
+async def cb_post_thread(callback: CallbackQuery):
+    """Publish thread to Threads."""
+    pending = pending_threads_content.pop(callback.from_user.id, None)
+    if not pending:
+        await callback.answer("No pending thread", show_alert=True)
+        return
+
+    threads_data = await get_threads_token_or_env(pool)
+    if not threads_data:
+        await callback.answer("Threads not connected!", show_alert=True)
+        return
+
+    await callback.answer("Publishing to Threads...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    try:
+        parts = pending["parts"]
+        if len(parts) == 1:
+            result = await post_to_threads(
+                threads_data["access_token"],
+                threads_data["user_id"],
+                parts[0],
+            )
+        else:
+            result = await post_thread_chain(
+                threads_data["access_token"],
+                threads_data["user_id"],
+                parts,
+            )
+
+        if result.get("success"):
+            count = result.get("count", 1)
+            await callback.message.reply(f"🧵 Posted to Threads! ({count} parts)")
+        else:
+            await callback.message.reply(f"❌ Threads error: {result}")
+    except Exception as e:
+        logger.error(f"Threads post error: {e}")
+        await callback.message.reply(f"❌ Threads error: {e}")
+
+
+@router.callback_query(F.data == "regenthread")
+async def cb_regen_thread(callback: CallbackQuery):
+    """Regenerate Threads content."""
+    pending = pending_threads_content.get(callback.from_user.id)
+    if not pending:
+        await callback.answer("Nothing to regenerate", show_alert=True)
+        return
+
+    await callback.answer("Regenerating...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    # Use first part as topic hint
+    topic = pending["parts"][0][:100]
+    content = await generate_threads_content(topic)
+    parts = content.get("parts", [])
+    fmt = content.get("format", "single")
+
+    if not parts:
+        await callback.message.reply("❌ Failed to regenerate.")
+        return
+
+    pending_threads_content[callback.from_user.id] = {"parts": parts, "format": fmt}
+
+    if fmt == "thread" and len(parts) > 1:
+        preview = "\n\n---\n\n".join(parts)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🧵 Post Thread ({len(parts)} parts)", callback_data="postthread"),
+                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
+            ],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread")],
+        ])
+        await callback.message.reply(f"🧵 Thread ({len(parts)} parts):\n\n{preview}", reply_markup=keyboard)
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🧵 Post to Threads", callback_data="postthread"),
+                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
+            ],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread")],
+        ])
+        await callback.message.reply(f"🧵 Single post:\n\n{parts[0]}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "cancelthread")
+async def cb_cancel_thread(callback: CallbackQuery):
+    pending_threads_content.pop(callback.from_user.id, None)
+    await callback.answer("Cancelled")
+    await callback.message.edit_reply_markup(reply_markup=None)
 
 
 # Comment state storage
