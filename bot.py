@@ -50,6 +50,19 @@ dp.include_router(router)
 pool = None
 
 
+async def get_threads_token_or_env(pool):
+    """Get Threads token from DB, fallback to env vars."""
+    import os
+    data = await get_threads_token_or_env(pool)
+    if data:
+        return data
+    token = os.getenv("THREADS_ACCESS_TOKEN", "")
+    user_id = os.getenv("THREADS_USER_ID", "")
+    if token and user_id:
+        return {"access_token": token, "user_id": user_id, "expires_at": None}
+    return None
+
+
 # ==================== TELEGRAM COMMANDS ====================
 
 @router.message(Command("start"))
@@ -105,7 +118,7 @@ async def cmd_status(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
     token_data = await get_linkedin_token(pool)
-    threads_data = await get_threads_token(pool)
+    threads_data = await get_threads_token_or_env(pool)
     
     lines = ["*Bot Status*\n"]
     
@@ -559,7 +572,7 @@ async def cb_approve(callback: CallbackQuery):
 
     if result["success"]:
         await update_post_status(pool, post_id, "posted", result["post_id"])
-        threads_data = await get_threads_token(pool)
+        threads_data = await get_threads_token_or_env(pool)
         if threads_data:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🧵 Also post to Threads", callback_data=f"threads:{post_id}")],
@@ -600,7 +613,7 @@ async def cb_approve_text_only(callback: CallbackQuery):
 
     if result["success"]:
         await update_post_status(pool, post_id, "posted", result["post_id"])
-        threads_data = await get_threads_token(pool)
+        threads_data = await get_threads_token_or_env(pool)
         if threads_data:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🧵 Also post to Threads", callback_data=f"threads:{post_id}")],
@@ -622,7 +635,7 @@ async def cb_post_to_threads(callback: CallbackQuery):
         await callback.answer("Post not found", show_alert=True)
         return
 
-    threads_data = await get_threads_token(pool)
+    threads_data = await get_threads_token_or_env(pool)
     if not threads_data:
         await callback.answer("Threads not connected! Use /threads", show_alert=True)
         return
@@ -665,7 +678,7 @@ async def cb_confirm_threads(callback: CallbackQuery):
         await callback.answer("No pending Threads post", show_alert=True)
         return
 
-    threads_data = await get_threads_token(pool)
+    threads_data = await get_threads_token_or_env(pool)
     if not threads_data:
         await callback.answer("Threads not connected!", show_alert=True)
         return

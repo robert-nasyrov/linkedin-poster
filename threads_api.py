@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 THREADS_APP_ID = os.getenv("THREADS_APP_ID", "1630209911587747")
 THREADS_APP_SECRET = os.getenv("THREADS_APP_SECRET", "")
 THREADS_REDIRECT_URI = os.getenv("THREADS_REDIRECT_URI", "https://linkedin-poster-production-5217.up.railway.app/threads/callback")
+THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "")
+THREADS_USER_ID = os.getenv("THREADS_USER_ID", "")
 
 GRAPH_API_BASE = "https://graph.threads.net"
 
