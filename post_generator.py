@@ -45,15 +45,6 @@ async def claude_request(client, json_body, max_retries=3):
                 raise
     raise Exception("Claude API: max retries exceeded")
 
-FORMATS = [
-    "FORMAT 1: Case Study — 'I built X — here's what it does and why it matters'",
-    "FORMAT 2: Before vs Now — 'This used to take hours. Now it takes seconds.'",
-    "FORMAT 3: Hot Take — 'Unpopular opinion about AI/media/business'",
-    "FORMAT 4: Scannable List — '5 things I learned building X'",
-    "FORMAT 5: Question Post — short case + genuine question for comments",
-    "FORMAT 6: Meta/Transparent — 'This post was written by AI and I just approved it. Here's why that matters.'",
-]
-
 # Load living context from file
 def load_robert_context() -> str:
     """Read robert_context.md for up-to-date personal context."""
@@ -67,65 +58,53 @@ def load_robert_context() -> str:
 
 ROBERT_CONTEXT = load_robert_context()
 
-SYSTEM_PROMPT = f"""You are a LinkedIn ghostwriter for Robert. Here is his living context — updated regularly from real conversations:
+SYSTEM_PROMPT = f"""You write LinkedIn posts as Robert. Not for Robert — AS him. His voice, his brain, his mess.
 
 {ROBERT_CONTEXT}
 
-=== THE SELLING ANGLE ===
-Robert's LinkedIn is not a diary. It's a sales channel for AI automation services.
-Every post should make readers think: "Wait, one person built all this? I need this for my business."
-Target audience: founders, COOs, agency owners, media companies.
+=== HOW TO WRITE ===
 
-=== POST FORMATS (rotate between these) ===
+Forget templates. Forget "5 tips" and "here's what I learned." Write like Robert actually thinks — sometimes it's a 3-line observation, sometimes it's a 250-word story. Let the topic decide the length and shape.
 
-FORMAT 1: Case Study — "I built X, here's what it does"
-- Problem → what you built → result → "If you're doing X manually, there's a better way."
-- This is the MONEY format. Use it most often.
+ENERGY TYPES (not templates — moods):
+- Raw story: Something that actually happened. Messy details. Real outcome. "My dad postponed English for 20 years. My bot fixed that in 3 days."
+- Honest fail: Something that went wrong and what it taught you. People remember vulnerability. "Spent 25 touchpoints on a client. Zero closed deals. Here's the one question I should have asked on day 1."
+- Observation: You noticed something others didn't. Short. Punchy. No fluff. Can be 3 sentences.
+- Contrarian take: You disagree with conventional wisdom and have experience to back it up. "Everyone says AI replaces jobs. I watched it create 3 new roles in my company."
+- Behind the scenes: Show the actual work. Mention real tools, real errors, real logs. "My bot generated a post about apps that don't exist. Fact-checker caught it. Here's the screenshot."
+- Quick thought: Sometimes the best post is 2-3 sentences. Don't pad it. Say the thing and stop.
 
-FORMAT 2: Before vs Now
-- Show the transformation with specific details and time savings.
+WHAT MAKES ROBERT'S POSTS HIT:
+- Specific > generic. "2,264 candidates processed" not "thousands of users"
+- Stories > advice. Show what happened, let the reader draw conclusions
+- Admit what you don't know or what failed
+- Name real tools: Claude, Telegram, Railway, Python, aiogram, Whisper
+- Reference real projects: Pulse Bot, TrabajaYa, ZBS Media, Plan Banan
+- Don't always end with a question. Sometimes end with a statement. Or nothing.
+- Vary length wildly. Some posts 50 words. Some 300. Never the same twice.
 
-FORMAT 3: Hot Take
-- Contrarian statement backed by personal experience. Invite disagreement.
+WHAT TO AVOID:
+- "Here's the thing" / "Let me tell you" / "Game-changer" / "Unpopular opinion:" as an opener
+- Numbered lists as the whole post (unless it genuinely fits)
+- Fake humility ("I'm no expert but...")
+- Motivational poster energy
+- Making up numbers, tools, clients, or stories. If it's not in the context above, don't invent it.
+- Writing the same post structure twice in a row
 
-FORMAT 4: Scannable List
-- "5 things I automated this year" — each item concrete with real result.
+=== PRIVACY ===
+- Never include: revenue figures, client names (unless public), team member names, financial details
+- OK to mention: ZBS Media, Plan Banan, SaveCharvak, TrabajaYa, Pulse Bot — these are public
 
-FORMAT 5: Question Post
-- Brief case study + genuine question. LinkedIn algorithm loves comments.
-
-FORMAT 6: Meta/Transparent
-- Be honest this post was AI-generated and you approved it. Demonstrates the product.
-
-=== WRITING STYLE ===
-- Language: ENGLISH only
-- Tone: Casual, direct, real. Like texting a smart friend about work.
-- Length: 100–300 words
-- Uses "—" em dashes
-- Concrete over abstract. Numbers over adjectives. Results over philosophy.
-- Name real tools: Claude, Telegram, Whisper, Railway, Python
-- OK to mention ZBS Media, Plan Banan, SaveCharvak by name — public brands
-- OK to say "my team of 15" or "bootstrapped" — this is positioning
-
-=== PRIVACY RULES — NEVER include: ===
-- Specific revenue, budgets, financial figures
-- Client names unless explicitly public
-- Team member names
-- Exact follower/subscriber counts
-- Internal financial details
-
-=== OUTPUT ===
-Pick the format that fits best. Default to FORMAT 1 if unsure.
-Write ONLY the post text. No labels, no meta-commentary.
-
-=== FACTUAL ACCURACY — CRITICAL ===
+=== FACTUAL ACCURACY ===
 - NEVER invent specific tools, apps, products, companies, or statistics
-- If you're not 100% sure something exists, describe the concept generically instead of naming it
-- "I saw apps that do X" is OK. "I used SpecificAppName which does X" is NOT OK unless you're certain it exists
+- If unsure something exists, describe the concept without naming it
 - Personal experiences and opinions don't need verification
-- When in doubt, keep it abstract: "the ecosystem" not "AppName 3.0"
 
-CRITICAL: LinkedIn does NOT support markdown. NEVER use asterisks, underscores, hash symbols, or backticks. Plain text only. Use line breaks and emoji for structure."""
+=== FORMAT ===
+- English only
+- NO markdown. No asterisks, no underscores, no hash symbols, no backticks
+- Plain text only. Use line breaks and emoji sparingly for structure.
+- Write ONLY the post text. No labels, no meta-commentary."""
 
 MEME_PROMPT = """Based on this LinkedIn post, suggest exactly ONE meme concept for supermeme.ai.
 
@@ -156,14 +135,24 @@ def clean_post_text(text: str) -> str:
 
 
 async def build_learning_context(pool) -> str:
-    """Build learning section from approved/rejected posts and user context."""
+    """Build learning section from approved/rejected posts, user context, AND daily life."""
     if not pool:
         return ""
 
     from database import get_approved_posts, get_rejected_posts, get_user_context
+    from digest_reader import get_digest_context
 
     sections = []
 
+    # What's happening in Robert's life (from digest bot DB)
+    try:
+        life = await get_digest_context()
+        if life:
+            sections.append(life)
+    except Exception as e:
+        logger.warning(f"Digest context load failed: {e}")
+
+    # What posts Robert approved/rejected (learning)
     approved = await get_approved_posts(pool, limit=5)
     if approved:
         examples = "\n---\n".join(approved[:3])
@@ -195,13 +184,12 @@ async def generate_post_from_digest(digest_text: str, pool=None) -> dict:
                 {
                     "role": "user",
                     "content": (
-                        f"Use this format: {random.choice(FORMATS)}\n\n"
-                        + (f"{learning}\n\n" if learning else "")
-                        + f"Here is my current context — daily digests, open work items, and life situation. "
-                        f"Extract something interesting and write a LinkedIn post. "
-                        f"Pick a theme that connects to broader trends (AI, media, entrepreneurship, productivity). "
-                        f"Remember: NEVER reveal private details, names, numbers, or clients.\n\n"
-                        f"{digest_text}"
+                        (f"{learning}\n\n" if learning else "")
+                        + f"Here's my current context — daily digests, open work items, and life situation.\n\n"
+                        f"{digest_text}\n\n"
+                        f"Write a LinkedIn post. Find the most interesting angle in this context. "
+                        f"Don't force a format — let the content decide if it's a story, observation, hot take, or quick thought. "
+                        f"Make it feel like something I'd actually write, not something a bot generated."
                     )
                 }
             ],
@@ -230,9 +218,10 @@ async def generate_post_from_topic(topic: str, pool=None) -> dict:
                 {
                     "role": "user",
                     "content": (
-                        f"Use this format: {random.choice(FORMATS)}\n\n"
-                        + (f"{learning}\n\n" if learning else "")
-                        + f"Write a LinkedIn post based on this thought:\n\n{topic}"
+                        (f"{learning}\n\n" if learning else "")
+                        + f"Write a LinkedIn post based on this thought:\n\n{topic}\n\n"
+                        f"Don't force a template. If it's a short observation, keep it short. "
+                        f"If it's a story, tell it properly. Let the thought decide the shape."
                     )
                 }
             ],

@@ -16,14 +16,33 @@ from database import save_digest
 logger = logging.getLogger(__name__)
 
 DIGEST_DATABASE_URL = os.getenv("DIGEST_DATABASE_URL", "")
+PULSE_DATABASE_URL = os.getenv("PULSE_DATABASE_URL", "")
 
 
 # ==================== DIGEST BOT DATABASE ====================
 
 async def get_digest_context() -> str:
     """Pull rich context from digest bot's PostgreSQL: summaries, open items, life context."""
+    sections = []
+
+    # 1. Digest DB (daily summaries, life context)
+    digest_ctx = await _read_digest_db()
+    if digest_ctx:
+        sections.append(digest_ctx)
+
+    # 2. Pulse Bot DB (goals, microsteps, reminders)
+    pulse_ctx = await _read_pulse_db()
+    if pulse_ctx:
+        sections.append(pulse_ctx)
+
+    result = "\n\n".join(sections)
+    logger.info(f"Loaded context: {len(result)} chars, {len(sections)} sections")
+    return result
+
+
+async def _read_digest_db() -> str:
+    """Read from digest bot database."""
     if not DIGEST_DATABASE_URL:
-        logger.warning("DIGEST_DATABASE_URL not set — skipping digest DB")
         return ""
 
     try:
@@ -80,7 +99,77 @@ async def get_digest_context() -> str:
         await conn.close()
 
     result = "\n\n".join(sections)
-    logger.info(f"Loaded digest context: {len(result)} chars, {len(sections)} sections")
+    logger.info(f"Loaded digest DB: {len(result)} chars")
+    return result
+
+
+async def _read_pulse_db() -> str:
+    """Read goals, microsteps, and reminders from Pulse Bot database."""
+    if not PULSE_DATABASE_URL:
+        return ""
+
+    try:
+        conn = await asyncpg.connect(PULSE_DATABASE_URL, timeout=10)
+    except Exception as e:
+        logger.error(f"Cannot connect to Pulse DB: {e}")
+        return ""
+
+    sections = []
+
+    try:
+        # Active microsteps (Robert's current goals and habits)
+        microsteps = await conn.fetch("""
+            SELECT text, status, created_at
+            FROM microsteps
+            WHERE user_id = (SELECT id FROM users WHERE telegram_id = 271065518 LIMIT 1)
+            ORDER BY created_at DESC
+            LIMIT 10
+        """)
+        if microsteps:
+            items = []
+            for m in microsteps:
+                status = m.get("status", "active")
+                text = m.get("text", "")
+                items.append(f"- [{status}] {text}")
+            sections.append("=== ROBERT'S GOALS & MICROSTEPS (from Pulse Bot) ===\n" + "\n".join(items))
+
+        # Active reminders
+        reminders = await conn.fetch("""
+            SELECT text, remind_at, status
+            FROM reminders
+            WHERE user_id = (SELECT id FROM users WHERE telegram_id = 271065518 LIMIT 1)
+              AND status = 'active'
+            ORDER BY remind_at DESC
+            LIMIT 10
+        """)
+        if reminders:
+            items = []
+            for r in reminders:
+                text = r.get("text", "")
+                remind_at = r["remind_at"].strftime("%Y-%m-%d %H:%M") if r.get("remind_at") else "?"
+                items.append(f"- {text} (remind: {remind_at})")
+            sections.append("=== ACTIVE REMINDERS ===\n" + "\n".join(items))
+
+        # Recent resolved topics (what Robert completed)
+        resolved = await conn.fetch("""
+            SELECT topic, resolved_at
+            FROM resolved_topics
+            WHERE user_id = (SELECT id FROM users WHERE telegram_id = 271065518 LIMIT 1)
+            ORDER BY resolved_at DESC
+            LIMIT 5
+        """)
+        if resolved:
+            items = [f"- {r['topic']}" for r in resolved]
+            sections.append("=== RECENTLY COMPLETED ===\n" + "\n".join(items))
+
+    except Exception as e:
+        logger.error(f"Error reading Pulse DB: {e}")
+    finally:
+        await conn.close()
+
+    result = "\n\n".join(sections)
+    if result:
+        logger.info(f"Loaded Pulse context: {len(result)} chars, {len(sections)} sections")
     return result
 
 
