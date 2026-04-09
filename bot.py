@@ -795,7 +795,7 @@ async def cb_approve_text_only(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("threads:"))
 async def cb_post_to_threads(callback: CallbackQuery):
-    """Adapt and post to Threads."""
+    """Generate Threads-native content from LinkedIn post."""
     post_id = int(callback.data.split(":")[1])
     post_data = await get_post(pool, post_id)
     if not post_data:
@@ -807,30 +807,42 @@ async def cb_post_to_threads(callback: CallbackQuery):
         await callback.answer("Threads not connected! Use /threads", show_alert=True)
         return
 
-    await callback.answer("Adapting for Threads...")
+    await callback.answer("Generating Threads version...")
     await callback.message.edit_reply_markup(reply_markup=None)
 
-    # Adapt post for Threads format
-    threads_text = await adapt_post_for_threads(post_data["post_text"])
+    # Generate full thread from LinkedIn post topic
+    content = await generate_threads_content(post_data["post_text"][:200])
+    parts = content.get("parts", [])
+    fmt = content.get("format", "single")
 
-    # Show preview before posting
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Post to Threads", callback_data=f"threadsconfirm:{post_id}"),
-            InlineKeyboardButton(text="❌ Skip", callback_data="cancelcomment"),
-        ],
-    ])
+    if not parts:
+        await callback.message.reply("❌ Failed to generate Threads content.")
+        return
 
-    # Store adapted text
+    # Store for approval
     pending_threads[callback.from_user.id] = {
         "post_id": post_id,
-        "text": threads_text,
+        "parts": parts,
+        "format": fmt,
     }
 
-    await callback.message.reply(
-        f"🧵 Threads version ({len(threads_text)} chars):\n\n{threads_text}",
-        reply_markup=keyboard
-    )
+    if fmt == "thread" and len(parts) > 1:
+        preview = "\n\n---\n\n".join(parts)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🧵 Post Thread ({len(parts)} parts)", callback_data=f"threadsconfirm:{post_id}"),
+                InlineKeyboardButton(text="❌ Skip", callback_data="cancelthread"),
+            ],
+        ])
+        await callback.message.reply(f"🧵 Thread ({len(parts)} parts):\n\n{preview}", reply_markup=keyboard)
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🧵 Post to Threads", callback_data=f"threadsconfirm:{post_id}"),
+                InlineKeyboardButton(text="❌ Skip", callback_data="cancelthread"),
+            ],
+        ])
+        await callback.message.reply(f"🧵 Single post ({len(parts[0])} chars):\n\n{parts[0]}", reply_markup=keyboard)
 
 
 # Threads state
@@ -839,7 +851,7 @@ pending_threads = {}
 
 @router.callback_query(F.data.startswith("threadsconfirm:"))
 async def cb_confirm_threads(callback: CallbackQuery):
-    """Publish to Threads."""
+    """Publish to Threads — single post or thread chain."""
     pending = pending_threads.pop(callback.from_user.id, None)
     if not pending:
         await callback.answer("No pending Threads post", show_alert=True)
@@ -854,13 +866,22 @@ async def cb_confirm_threads(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
 
     try:
-        result = await post_to_threads(
-            threads_data["access_token"],
-            threads_data["user_id"],
-            pending["text"],
-        )
+        parts = pending.get("parts", [pending.get("text", "")])
+        if len(parts) == 1:
+            result = await post_to_threads(
+                threads_data["access_token"],
+                threads_data["user_id"],
+                parts[0],
+            )
+        else:
+            result = await post_thread_chain(
+                threads_data["access_token"],
+                threads_data["user_id"],
+                parts,
+            )
         if result.get("success"):
-            await callback.message.reply(f"🧵 Posted to Threads! ID: {result['post_id']}")
+            count = result.get("count", 1)
+            await callback.message.reply(f"🧵 Posted to Threads! ({count} parts)")
         else:
             await callback.message.reply(f"❌ Threads error: {result}")
     except Exception as e:
