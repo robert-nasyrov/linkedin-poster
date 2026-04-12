@@ -77,7 +77,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "🚀 *LinkedIn + Threads Auto-Poster Bot*\n\n"
         "Posts:\n"
-        "/generate — Generate post from recent digests\n"
+        "/generate — Auto-generate post from your life context\n"
         "/write <topic> — Write post from your thought\n"
         "/twrite <topic> — Write for Threads (thread chains)\n"
         "/post <text> — Post ready text directly (no AI)\n\n"
@@ -158,24 +158,32 @@ async def cmd_fetch(message: Message):
 
 @router.message(Command("generate"))
 async def cmd_generate(message: Message):
+    """Auto-generate a post from Robert's current life context — no topic needed."""
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
 
-    await message.answer("📡 Fetching latest digests...")
-    await fetch_recent_digests(pool, hours=48)
-
-    result = await fetch_digests_for_post(pool)
-    if not result:
-        await message.answer("❌ No unprocessed digests found. Try /fetch first or /write <topic>")
-        return
-
-    digest_text, digest_ids = result
-    await message.answer(f"🧠 Analyzing {len(digest_ids)} digests and generating post...")
+    await message.answer("🧠 Reading your life context and generating post...")
 
     try:
-        generated = await generate_post_from_digest(digest_text, pool=pool)
-        post_id = await save_post(pool, digest_ids, generated["post_text"], generated["meme"])
-        await mark_digests_processed(pool, digest_ids)
+        from post_generator import build_learning_context
+        from digest_reader import get_digest_context
+
+        # Gather all context
+        life_context = await get_digest_context()
+        learning = await build_learning_context(pool)
+        
+        combined = ""
+        if life_context:
+            combined += f"{life_context}\n\n"
+        if learning:
+            combined += f"{learning}\n\n"
+
+        if not combined.strip():
+            await message.answer("❌ No life context found. Use /write <topic> instead, or add context with /context")
+            return
+
+        generated = await generate_post_from_digest(combined, pool=pool)
+        post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
         await send_approval(message.chat.id, post_id, generated)
     except Exception as e:
         logger.error(f"Generation error: {e}")
