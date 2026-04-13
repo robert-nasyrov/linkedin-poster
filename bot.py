@@ -968,20 +968,17 @@ async def cb_confirm_threads(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("regen:"))
 async def cb_regenerate(callback: CallbackQuery):
     post_id = int(callback.data.split(":")[1])
-    await callback.answer("Regenerating...")
+    await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.reply("🔄 Regenerating post...")
+    await callback.message.reply(
+        f"🔄 What didn't work about this post? (helps me write a better one)\n"
+        f"Or send /skip to regenerate without feedback."
+    )
+    regen_states[callback.from_user.id] = post_id
 
-    post_data = await get_post(pool, post_id)
-    if not post_data:
-        return
 
-    try:
-        generated = await generate_post_from_topic(post_data["post_text"][:100], pool=pool)
-        await update_post_text(pool, post_id, generated["post_text"], generated.get("meme"))
-        await send_approval(callback.message.chat.id, post_id, generated)
-    except Exception as e:
-        await callback.message.reply(f"❌ Error: {e}")
+# Regen state
+regen_states = {}
 
 
 @router.callback_query(F.data.startswith("edit:"))
@@ -1018,6 +1015,17 @@ async def cmd_skip(message: Message):
     if message.from_user.id in reject_states:
         reject_states.pop(message.from_user.id)
         await message.answer("⏭ Skipped. No feedback saved.")
+    if message.from_user.id in regen_states:
+        post_id = regen_states.pop(message.from_user.id)
+        await message.answer("🔄 Regenerating without feedback...")
+        post_data = await get_post(pool, post_id)
+        if post_data:
+            try:
+                generated = await generate_post_from_topic(post_data["post_text"][:100], pool=pool)
+                await update_post_text(pool, post_id, generated["post_text"], generated.get("meme"))
+                await send_approval(message.chat.id, post_id, generated)
+            except Exception as e:
+                await message.answer(f"❌ Error: {e}")
 
 @router.message(Command("context"))
 async def cmd_context(message: Message):
@@ -1055,6 +1063,23 @@ async def cmd_context(message: Message):
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_free_text(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    # Handle regen feedback
+    if message.from_user.id in regen_states:
+        post_id = regen_states.pop(message.from_user.id)
+        feedback = message.text
+        await message.answer(f"🔄 Got it. Regenerating with your feedback...")
+        post_data = await get_post(pool, post_id)
+        if post_data:
+            try:
+                generated = await generate_post_from_topic(
+                    post_data["post_text"][:200], pool=pool, feedback=feedback
+                )
+                await update_post_text(pool, post_id, generated["post_text"], generated.get("meme"))
+                await send_approval(message.chat.id, post_id, generated)
+            except Exception as e:
+                await message.answer(f"❌ Error: {e}")
         return
 
     # Handle reject reason

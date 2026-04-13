@@ -228,9 +228,17 @@ async def generate_post_from_digest(digest_text: str, pool=None) -> dict:
         return {"post_text": post_text, "meme": visual, "fact_check": fact_check}
 
 
-async def generate_post_from_topic(topic: str, pool=None) -> dict:
+async def generate_post_from_topic(topic: str, pool=None, feedback: str = None) -> dict:
     """Generate a LinkedIn post from a manual topic/thought with learning."""
     learning = await build_learning_context(pool)
+
+    feedback_block = ""
+    if feedback:
+        feedback_block = (
+            f"\n\nIMPORTANT — The previous version of this post was rejected. "
+            f"Here's what was wrong: {feedback}\n"
+            f"Write a DIFFERENT post that fixes this issue. Don't repeat the same structure or approach.\n\n"
+        )
 
     async with httpx.AsyncClient(timeout=60) as client:
         data = await claude_request(client, {
@@ -242,6 +250,7 @@ async def generate_post_from_topic(topic: str, pool=None) -> dict:
                     "role": "user",
                     "content": (
                         (f"{learning}\n\n" if learning else "")
+                        + feedback_block
                         + f"Write a LinkedIn post based on this thought:\n\n{topic}\n\n"
                         f"Don't force a template. If it's a short observation, keep it short. "
                         f"If it's a story, tell it properly. Let the thought decide the shape."
