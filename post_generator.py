@@ -135,16 +135,16 @@ def clean_post_text(text: str) -> str:
 
 
 async def build_learning_context(pool) -> str:
-    """Build learning section from approved/rejected posts, user context, AND daily life."""
+    """Build learning section from approved/rejected posts, user context, daily life, AND audience engagement."""
     if not pool:
         return ""
 
-    from database import get_approved_posts, get_rejected_posts, get_user_context
+    from database import get_approved_posts, get_rejected_posts, get_user_context, get_top_posts
     from digest_reader import get_digest_context
 
     sections = []
 
-    # What's happening in Robert's life (from digest bot DB)
+    # What's happening in Robert's life (from Pulse Bot + digest DB)
     try:
         life = await get_digest_context()
         if life:
@@ -152,7 +152,30 @@ async def build_learning_context(pool) -> str:
     except Exception as e:
         logger.warning(f"Digest context load failed: {e}")
 
-    # What posts Robert approved/rejected (learning)
+    # TOP PERFORMING POSTS — what the AUDIENCE likes (not just Robert)
+    try:
+        top = await get_top_posts(pool, limit=5)
+        if top:
+            examples = []
+            for t in top:
+                platform = t.get("platform", "?")
+                likes = t.get("likes", 0)
+                comments = t.get("comments", 0)
+                shares = t.get("shares", 0)
+                views = t.get("views", 0)
+                text = t.get("post_text", "")[:250]
+                score = t.get("engagement_score", 0)
+                examples.append(
+                    f"[{platform}] {likes} likes, {comments} comments, {shares} shares, {views} views (score: {score})\n{text}..."
+                )
+            sections.append(
+                "=== TOP PERFORMING POSTS (audience loved these — write more like them) ===\n"
+                + "\n---\n".join(examples)
+            )
+    except Exception as e:
+        logger.warning(f"Top posts load failed: {e}")
+
+    # What posts Robert approved/rejected (his taste)
     approved = await get_approved_posts(pool, limit=5)
     if approved:
         examples = "\n---\n".join(approved[:3])

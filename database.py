@@ -53,11 +53,24 @@ async def init_db(pool):
                 expires_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS post_stats (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER REFERENCES linkedin_posts(id),
+                platform TEXT NOT NULL,
+                platform_post_id TEXT,
+                likes INTEGER DEFAULT 0,
+                comments INTEGER DEFAULT 0,
+                shares INTEGER DEFAULT 0,
+                views INTEGER DEFAULT 0,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
         """)
         # Add columns if they don't exist (safe migration)
         await conn.execute("""
             DO $$ BEGIN
                 ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+                ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS threads_post_id TEXT;
             EXCEPTION WHEN others THEN NULL;
             END $$;
         """)
@@ -215,3 +228,58 @@ async def get_threads_token(pool):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM threads_tokens WHERE id = 1")
         return dict(row) if row else None
+
+
+async def save_post_stats(pool, post_id: int, platform: str, platform_post_id: str,
+                          likes: int = 0, comments: int = 0, shares: int = 0, views: int = 0):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO post_stats (post_id, platform, platform_post_id, likes, comments, shares, views, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+               ON CONFLICT ON CONSTRAINT post_stats_pkey DO NOTHING""",
+            post_id, platform, platform_post_id, likes, comments, shares, views
+        )
+        # Update if exists
+        await conn.execute(
+            """UPDATE post_stats SET likes = $1, comments = $2, shares = $3, views = $4, updated_at = NOW()
+               WHERE post_id = $5 AND platform = $6""",
+            likes, comments, shares, views, post_id, platform
+        )
+
+
+async def save_threads_post_id(pool, post_id: int, threads_post_id: str):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE linkedin_posts SET threads_post_id = $1 WHERE id = $2",
+            threads_post_id, post_id
+        )
+
+
+async def get_posted_posts_for_stats(pool):
+    """Get posts that have been published and need stats refresh."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, post_text, linkedin_post_id, threads_post_id, posted_at
+               FROM linkedin_posts
+               WHERE status = 'posted'
+               AND posted_at > NOW() - INTERVAL '30 days'
+               ORDER BY posted_at DESC
+               LIMIT 30"""
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_top_posts(pool, limit: int = 5):
+    """Get top-performing posts by total engagement (likes + comments + shares)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT lp.post_text, ps.platform, ps.likes, ps.comments, ps.shares, ps.views,
+                      (ps.likes + ps.comments * 3 + ps.shares * 5) as engagement_score
+               FROM post_stats ps
+               JOIN linkedin_posts lp ON lp.id = ps.post_id
+               WHERE ps.likes + ps.comments + ps.shares > 0
+               ORDER BY engagement_score DESC
+               LIMIT $1""",
+            limit
+        )
+        return [dict(r) for r in rows]

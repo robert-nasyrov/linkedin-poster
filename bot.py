@@ -39,6 +39,7 @@ from threads_api import (
     get_threads_auth_url, exchange_threads_code, post_to_threads,
     adapt_post_for_threads, generate_threads_content, post_thread_chain,
 )
+from stats_tracker import collect_all_stats
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -86,10 +87,10 @@ async def cmd_start(message: Message):
         "/comment <url> — Generate comment for a post\n\n"
         "Settings:\n"
         "/context <update> — Add context about your life/work\n"
+        "/stats — See top performing posts\n"
         "/connect — Connect LinkedIn account\n"
         "/threads — Connect Threads account\n"
-        "/status — Check bot & token status\n"
-        "/fetch — Fetch latest digests now\n",
+        "/status — Check bot & token status\n",
         parse_mode="Markdown"
     )
 
@@ -147,13 +148,75 @@ async def cmd_status(message: Message):
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Show top performing posts."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    
+    from database import get_top_posts
+    top = await get_top_posts(pool, limit=5)
+    
+    if not top:
+        await message.answer("📊 No stats yet. Posts will be tracked after publishing. Stats collected daily at 21:00.")
+        return
+    
+    lines = ["📊 Top Performing Posts:\n"]
+    for i, t in enumerate(top):
+        platform = t.get("platform", "?")
+        likes = t.get("likes", 0)
+        comments = t.get("comments", 0)
+        shares = t.get("shares", 0)
+        views = t.get("views", 0)
+        text = t.get("post_text", "")[:100]
+        lines.append(f"{i+1}. [{platform}] {likes}❤️ {comments}💬 {shares}🔄 {views}👁\n   {text}...")
+    
+    await message.answer("\n".join(lines))
+
+
 @router.message(Command("fetch"))
 async def cmd_fetch(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
     await message.answer("📡 Fetching digests...")
-    msgs = await fetch_recent_digests(pool, hours=48)
-    await message.answer(f"✅ Fetched {len(msgs)} new digest messages")
+    await fetch_recent_digests(pool, hours=48)
+    await message.answer("✅ Done")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Show top-performing posts."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    from database import get_top_posts
+    top = await get_top_posts(pool, limit=5)
+
+    if not top:
+        # Try collecting stats now
+        await message.answer("📊 No stats yet. Collecting now...")
+        li_token = await get_linkedin_token(pool)
+        threads_data = await get_threads_token_or_env(pool)
+        li_access = li_token["access_token"] if li_token else None
+        th_access = threads_data["access_token"] if threads_data else None
+        updated = await collect_all_stats(pool, li_access, th_access)
+        if updated:
+            top = await get_top_posts(pool, limit=5)
+
+    if not top:
+        await message.answer("📊 No engagement data yet. Stats collect daily at 21:00.")
+        return
+
+    lines = ["📊 Top performing posts:\n"]
+    for i, p in enumerate(top):
+        platform = p["platform"].upper()
+        text_preview = p["post_text"][:80].replace("\n", " ")
+        lines.append(
+            f"{i+1}. [{platform}] {p['likes']}❤️ {p['comments']}💬 {p['shares']}🔄"
+            f"\n   {text_preview}..."
+        )
+
+    await message.answer("\n\n".join(lines))
 
 
 @router.message(Command("generate"))
@@ -889,6 +952,11 @@ async def cb_confirm_threads(callback: CallbackQuery):
             )
         if result.get("success"):
             count = result.get("count", 1)
+            post_id = pending.get("post_id")
+            threads_pid = result.get("post_id") or (result.get("post_ids", [None])[0])
+            if post_id and threads_pid:
+                from database import save_threads_post_id
+                await save_threads_post_id(pool, post_id, str(threads_pid))
             await callback.message.reply(f"🧵 Posted to Threads! ({count} parts)")
         else:
             await callback.message.reply(f"❌ Threads error: {result}")
@@ -1030,7 +1098,7 @@ async def handle_free_text(message: Message):
 # ==================== SCHEDULER ====================
 
 async def scheduled_post_generation():
-    """Run on schedule — fetch digests and generate post for approval."""
+    """Run on schedule — generate post from life context for approval."""
     while True:
         now = datetime.now(timezone.utc)
         # Tashkent is UTC+5
@@ -1040,15 +1108,20 @@ async def scheduled_post_generation():
         if tashkent_weekday in POST_DAYS and tashkent_hour == POST_HOUR:
             logger.info("Scheduled post generation triggered")
             try:
-                await fetch_recent_digests(pool, hours=48)
-                result = await fetch_digests_for_post(pool)
-                if result:
-                    digest_text, digest_ids = result
-                    generated = await generate_post_from_digest(digest_text, pool=pool)
-                    post_id = await save_post(pool, digest_ids, generated["post_text"], generated["meme"])
-                    await mark_digests_processed(pool, digest_ids)
+                from post_generator import build_learning_context
+                from digest_reader import get_digest_context
+                
+                life_context = await get_digest_context()
+                learning = await build_learning_context(pool)
+                combined = f"{life_context}\n\n{learning}".strip()
+                
+                if combined:
+                    generated = await generate_post_from_digest(combined, pool=pool)
+                    post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
                     await send_approval(TELEGRAM_ADMIN_ID, post_id, generated)
                     logger.info(f"Scheduled post #{post_id} sent for approval")
+                else:
+                    logger.info("No context available for scheduled post")
             except Exception as e:
                 logger.error(f"Scheduled generation error: {e}")
                 await bot.send_message(TELEGRAM_ADMIN_ID, f"⚠️ Scheduled post error: {e}")
@@ -1057,6 +1130,30 @@ async def scheduled_post_generation():
             await asyncio.sleep(3600)
         else:
             # Check every 10 minutes
+            await asyncio.sleep(600)
+
+
+async def scheduled_stats_collection():
+    """Collect engagement stats from LinkedIn and Threads once daily."""
+    while True:
+        now = datetime.now(timezone.utc)
+        tashkent_hour = (now.hour + 5) % 24
+
+        # Run at 21:00 Tashkent time (evening, after engagement settles)
+        if tashkent_hour == 21:
+            logger.info("Running daily stats collection")
+            try:
+                li_token = await get_linkedin_token(pool)
+                threads_data = await get_threads_token_or_env(pool)
+                
+                updated = await collect_all_stats(pool, li_token, threads_data)
+                if updated:
+                    logger.info(f"Stats updated for {updated} posts")
+            except Exception as e:
+                logger.error(f"Stats collection error: {e}")
+
+            await asyncio.sleep(3600)
+        else:
             await asyncio.sleep(600)
 
 
@@ -1164,6 +1261,7 @@ async def main():
 
     # Start scheduler
     asyncio.create_task(scheduled_post_generation())
+    asyncio.create_task(scheduled_stats_collection())
     logger.info(f"Scheduler started: days={POST_DAYS}, hour={POST_HOUR}:00 UZT")
 
     # Start bot
