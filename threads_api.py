@@ -46,7 +46,12 @@ async def exchange_threads_code(code: str) -> dict:
                 "code": code,
             },
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logger.error(
+                f"Threads short-token exchange failed: {resp.status_code} "
+                f"body={resp.text[:500]} redirect_uri={THREADS_REDIRECT_URI}"
+            )
+            resp.raise_for_status()
         data = resp.json()
         short_token = data["access_token"]
         user_id = data["user_id"]
@@ -60,7 +65,11 @@ async def exchange_threads_code(code: str) -> dict:
                 "access_token": short_token,
             },
         )
-        resp2.raise_for_status()
+        if resp2.status_code != 200:
+            logger.error(
+                f"Threads long-token exchange failed: {resp2.status_code} body={resp2.text[:500]}"
+            )
+            resp2.raise_for_status()
         long_data = resp2.json()
 
         return {
