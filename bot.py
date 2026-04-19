@@ -425,39 +425,58 @@ async def cmd_twrite(message: Message):
         "format": fmt,
     }
 
-    # Show preview
-    if fmt == "thread" and len(parts) > 1:
-        preview = "\n\n---\n\n".join(parts)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"🧵 Post Thread ({len(parts)} parts)", callback_data="postthread"),
-                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
-            ],
-            [
-                InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread"),
-            ],
-        ])
-        await message.answer(
-            f"🧵 Thread ({len(parts)} parts):\n\n{preview}",
-            reply_markup=keyboard
-        )
-    else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🧵 Post to Threads", callback_data="postthread"),
-                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
-            ],
-            [
-                InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread"),
-            ],
-        ])
-        await message.answer(
-            f"🧵 Single post ({len(parts[0])} chars):\n\n{parts[0]}",
-            reply_markup=keyboard
-        )
+    await show_thread_preview(message.chat.id, parts, fmt, source="twrite")
 
 
 pending_threads_content = {}
+
+
+def _split_thread_edit(text: str) -> list:
+    """Split user-sent edited thread on '---' separator. Trim and cap each part at 500 chars."""
+    import re
+    raw_parts = re.split(r"(?m)^\s*---\s*$", text)
+    parts = []
+    for p in raw_parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > 500:
+            p = p[:497] + "..."
+        parts.append(p)
+    return parts
+
+
+async def show_thread_preview(chat_id: int, parts: list, fmt: str, source: str, post_id: int | None = None):
+    """Render a Threads preview with Post / Regenerate / Edit / Cancel buttons.
+
+    source:
+      'twrite'   → standalone /twrite flow (uses pending_threads_content)
+      'linkedin' → 'Also post to Threads' flow after LinkedIn publish (uses pending_threads)
+    """
+    post_cb = "postthread" if source == "twrite" else f"threadsconfirm:{post_id}"
+    regen_cb = "regenthread" if source == "twrite" else f"regenthreadli:{post_id}"
+    edit_cb = "editthread" if source == "twrite" else f"editthreadli:{post_id}"
+
+    is_thread = fmt == "thread" and len(parts) > 1
+    if is_thread:
+        preview = "\n\n---\n\n".join(parts)
+        header = f"🧵 Thread ({len(parts)} parts):\n\n{preview}"
+        post_btn_text = f"🧵 Post Thread ({len(parts)} parts)"
+    else:
+        header = f"🧵 Single post ({len(parts[0])} chars):\n\n{parts[0]}"
+        post_btn_text = "🧵 Post to Threads"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=post_btn_text, callback_data=post_cb),
+            InlineKeyboardButton(text="🔄 Regenerate", callback_data=regen_cb),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Edit", callback_data=edit_cb),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread"),
+        ],
+    ])
+    await bot.send_message(chat_id, header, reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "postthread")
@@ -523,33 +542,78 @@ async def cb_regen_thread(callback: CallbackQuery):
         return
 
     pending_threads_content[callback.from_user.id] = {"parts": parts, "format": fmt}
-
-    if fmt == "thread" and len(parts) > 1:
-        preview = "\n\n---\n\n".join(parts)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"🧵 Post Thread ({len(parts)} parts)", callback_data="postthread"),
-                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
-            ],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread")],
-        ])
-        await callback.message.reply(f"🧵 Thread ({len(parts)} parts):\n\n{preview}", reply_markup=keyboard)
-    else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🧵 Post to Threads", callback_data="postthread"),
-                InlineKeyboardButton(text="🔄 Regenerate", callback_data="regenthread"),
-            ],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="cancelthread")],
-        ])
-        await callback.message.reply(f"🧵 Single post:\n\n{parts[0]}", reply_markup=keyboard)
+    await show_thread_preview(callback.message.chat.id, parts, fmt, source="twrite")
 
 
 @router.callback_query(F.data == "cancelthread")
 async def cb_cancel_thread(callback: CallbackQuery):
     pending_threads_content.pop(callback.from_user.id, None)
+    pending_threads.pop(callback.from_user.id, None)
     await callback.answer("Cancelled")
     await callback.message.edit_reply_markup(reply_markup=None)
+
+
+@router.callback_query(F.data == "editthread")
+async def cb_edit_thread(callback: CallbackQuery):
+    """Edit /twrite thread content — user sends back full text with '---' between parts."""
+    pending = pending_threads_content.get(callback.from_user.id)
+    if not pending:
+        await callback.answer("Nothing to edit", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    current = "\n\n---\n\n".join(pending["parts"])
+    await callback.message.reply(
+        "✏️ Send me the edited thread.\n"
+        "Separate parts with a line containing only `---`.\n"
+        "Max 500 chars per part.\n\n"
+        f"Current version:\n\n{current}"
+    )
+    edit_states[callback.from_user.id] = "thread_twrite"
+
+
+@router.callback_query(F.data.startswith("editthreadli:"))
+async def cb_edit_thread_li(callback: CallbackQuery):
+    """Edit thread from 'Also post to Threads' flow."""
+    pending = pending_threads.get(callback.from_user.id)
+    if not pending:
+        await callback.answer("Nothing to edit", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    current = "\n\n---\n\n".join(pending["parts"])
+    await callback.message.reply(
+        "✏️ Send me the edited thread.\n"
+        "Separate parts with a line containing only `---`.\n"
+        "Max 500 chars per part.\n\n"
+        f"Current version:\n\n{current}"
+    )
+    edit_states[callback.from_user.id] = "thread_linkedin"
+
+
+@router.callback_query(F.data.startswith("regenthreadli:"))
+async def cb_regen_thread_li(callback: CallbackQuery):
+    """Regenerate thread from 'Also post to Threads' flow."""
+    pending = pending_threads.get(callback.from_user.id)
+    if not pending:
+        await callback.answer("Nothing to regenerate", show_alert=True)
+        return
+
+    await callback.answer("Regenerating...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    topic = pending["parts"][0][:200]
+    content = await generate_threads_content(topic)
+    parts = content.get("parts", [])
+    fmt = content.get("format", "single")
+
+    if not parts:
+        await callback.message.reply("❌ Failed to regenerate.")
+        return
+
+    post_id = pending.get("post_id")
+    pending_threads[callback.from_user.id] = {"post_id": post_id, "parts": parts, "format": fmt}
+    await show_thread_preview(callback.message.chat.id, parts, fmt, source="linkedin", post_id=post_id)
 
 
 # Comment state storage
@@ -897,23 +961,7 @@ async def cb_post_to_threads(callback: CallbackQuery):
         "format": fmt,
     }
 
-    if fmt == "thread" and len(parts) > 1:
-        preview = "\n\n---\n\n".join(parts)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"🧵 Post Thread ({len(parts)} parts)", callback_data=f"threadsconfirm:{post_id}"),
-                InlineKeyboardButton(text="❌ Skip", callback_data="cancelthread"),
-            ],
-        ])
-        await callback.message.reply(f"🧵 Thread ({len(parts)} parts):\n\n{preview}", reply_markup=keyboard)
-    else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🧵 Post to Threads", callback_data=f"threadsconfirm:{post_id}"),
-                InlineKeyboardButton(text="❌ Skip", callback_data="cancelthread"),
-            ],
-        ])
-        await callback.message.reply(f"🧵 Single post ({len(parts[0])} chars):\n\n{parts[0]}", reply_markup=keyboard)
+    await show_thread_preview(callback.message.chat.id, parts, fmt, source="linkedin", post_id=post_id)
 
 
 # Threads state
@@ -1095,6 +1143,39 @@ async def handle_free_text(message: Message):
         state = edit_states.pop(message.from_user.id)
         new_text = message.text
 
+        # Thread edit (from /twrite)
+        if state == "thread_twrite":
+            parts = _split_thread_edit(new_text)
+            if not parts:
+                await message.answer("❌ Empty edit. Cancelled.")
+                return
+            pending_threads_content[message.from_user.id] = {
+                "parts": parts,
+                "format": "thread" if len(parts) > 1 else "single",
+            }
+            await message.answer("✅ Thread updated. Preview:")
+            fmt = "thread" if len(parts) > 1 else "single"
+            await show_thread_preview(message.chat.id, parts, fmt, source="twrite")
+            return
+
+        # Thread edit (from 'Also post to Threads' flow)
+        if state == "thread_linkedin":
+            parts = _split_thread_edit(new_text)
+            if not parts:
+                await message.answer("❌ Empty edit. Cancelled.")
+                return
+            existing = pending_threads.get(message.from_user.id, {})
+            post_id = existing.get("post_id")
+            pending_threads[message.from_user.id] = {
+                "post_id": post_id,
+                "parts": parts,
+                "format": "thread" if len(parts) > 1 else "single",
+            }
+            await message.answer("✅ Thread updated. Preview:")
+            fmt = "thread" if len(parts) > 1 else "single"
+            await show_thread_preview(message.chat.id, parts, fmt, source="linkedin", post_id=post_id)
+            return
+
         # Comment edit
         if state == "comment":
             if message.from_user.id in pending_comments:
@@ -1170,8 +1251,11 @@ async def scheduled_stats_collection():
             try:
                 li_token = await get_linkedin_token(pool)
                 threads_data = await get_threads_token_or_env(pool)
-                
-                updated = await collect_all_stats(pool, li_token, threads_data)
+
+                li_access = li_token["access_token"] if li_token else None
+                th_access = threads_data["access_token"] if threads_data else None
+
+                updated = await collect_all_stats(pool, li_access, th_access)
                 if updated:
                     logger.info(f"Stats updated for {updated} posts")
             except Exception as e:

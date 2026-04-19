@@ -139,7 +139,10 @@ async def build_learning_context(pool) -> str:
     if not pool:
         return ""
 
-    from database import get_approved_posts, get_rejected_posts, get_user_context, get_top_posts
+    from database import (
+        get_approved_posts, get_rejected_posts, get_user_context,
+        get_top_posts, get_low_engagement_posts, get_recent_comments,
+    )
     from digest_reader import get_digest_context
 
     sections = []
@@ -174,6 +177,41 @@ async def build_learning_context(pool) -> str:
             )
     except Exception as e:
         logger.warning(f"Top posts load failed: {e}")
+
+    # LOW-ENGAGEMENT POSTS — audience ignored these, avoid the pattern
+    try:
+        flops = await get_low_engagement_posts(pool, limit=3, min_age_days=3)
+        if flops:
+            examples = []
+            for f in flops:
+                platform = f.get("platform", "?")
+                text = f.get("post_text", "")[:200]
+                examples.append(f"[{platform}] {f.get('likes', 0)}❤️ {f.get('comments', 0)}💬\n{text}...")
+            sections.append(
+                "=== LOW-ENGAGEMENT POSTS (audience scrolled past — DON'T write like these) ===\n"
+                + "\n---\n".join(examples)
+            )
+    except Exception as e:
+        logger.warning(f"Low engagement load failed: {e}")
+
+    # AUDIENCE COMMENTS — what people actually said
+    try:
+        recent_comments = await get_recent_comments(pool, limit=15, days=30)
+        if recent_comments:
+            lines = []
+            for c in recent_comments:
+                platform = c.get("platform", "?")
+                author = c.get("author", "?")
+                text = c.get("text", "").strip()[:200]
+                post_preview = (c.get("post_text") or "")[:80].replace("\n", " ")
+                lines.append(f"[{platform}] {author} on \"{post_preview}...\": {text}")
+            sections.append(
+                "=== WHAT READERS SAID IN COMMENTS (their actual words — mine for angles, "
+                "objections, intent-to-buy signals) ===\n"
+                + "\n".join(lines)
+            )
+    except Exception as e:
+        logger.warning(f"Recent comments load failed: {e}")
 
     # What posts Robert approved/rejected (his taste)
     approved = await get_approved_posts(pool, limit=5)

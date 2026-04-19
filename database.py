@@ -65,6 +65,17 @@ async def init_db(pool):
                 views INTEGER DEFAULT 0,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS post_comments (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER REFERENCES linkedin_posts(id),
+                platform TEXT NOT NULL,
+                platform_comment_id TEXT,
+                author TEXT,
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(platform, platform_comment_id)
+            );
         """)
         # Add columns if they don't exist (safe migration)
         await conn.execute("""
@@ -279,6 +290,49 @@ async def get_top_posts(pool, limit: int = 5):
                JOIN linkedin_posts lp ON lp.id = ps.post_id
                WHERE ps.likes + ps.comments + ps.shares > 0
                ORDER BY engagement_score DESC
+               LIMIT $1""",
+            limit
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_low_engagement_posts(pool, limit: int = 3, min_age_days: int = 3):
+    """Posts published >N days ago that got close to zero engagement — use as anti-examples."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT lp.post_text, ps.platform, ps.likes, ps.comments, ps.shares
+               FROM post_stats ps
+               JOIN linkedin_posts lp ON lp.id = ps.post_id
+               WHERE lp.posted_at < NOW() - INTERVAL '{int(min_age_days)} days'
+                 AND (ps.likes + ps.comments + ps.shares) <= 2
+               ORDER BY lp.posted_at DESC
+               LIMIT $1""",
+            limit
+        )
+        return [dict(r) for r in rows]
+
+
+async def save_post_comment(pool, post_id: int, platform: str, platform_comment_id: str,
+                             author: str, text: str):
+    """Save a comment from LinkedIn/Threads. Skips duplicates via unique constraint."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO post_comments (post_id, platform, platform_comment_id, author, text)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (platform, platform_comment_id) DO NOTHING""",
+            post_id, platform, platform_comment_id, author, text
+        )
+
+
+async def get_recent_comments(pool, limit: int = 10, days: int = 30):
+    """Get recent comments across both platforms, joined with post text for context."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT pc.platform, pc.author, pc.text, lp.post_text
+               FROM post_comments pc
+               JOIN linkedin_posts lp ON lp.id = pc.post_id
+               WHERE pc.created_at > NOW() - INTERVAL '{int(days)} days'
+               ORDER BY pc.created_at DESC
                LIMIT $1""",
             limit
         )

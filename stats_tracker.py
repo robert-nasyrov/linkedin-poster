@@ -8,11 +8,16 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+def _linkedin_urn(share_id: str) -> str:
+    """Accept either a raw numeric id or a full URN like 'urn:li:share:...' / 'urn:li:ugcPost:...'."""
+    sid = (share_id or "").strip()
+    return sid if sid.startswith("urn:li:") else f"urn:li:share:{sid}"
+
+
 async def fetch_linkedin_stats(access_token: str, share_id: str) -> dict:
     """Fetch likes, comments, shares for a LinkedIn post."""
     try:
-        # LinkedIn Social Actions API
-        encoded_urn = f"urn:li:share:{share_id}"
+        encoded_urn = _linkedin_urn(share_id)
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"https://api.linkedin.com/v2/socialActions/{encoded_urn}",
@@ -64,9 +69,71 @@ async def fetch_threads_stats(access_token: str, post_id: str) -> dict:
         return None
 
 
+async def fetch_linkedin_comments(access_token: str, share_id: str) -> list:
+    """Fetch first-level comments on a LinkedIn post. Returns [] on failure."""
+    try:
+        urn = _linkedin_urn(share_id)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://api.linkedin.com/v2/socialActions/{urn}/comments",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning(f"LinkedIn comments {resp.status_code} for {share_id}: {resp.text[:200]}")
+                return []
+            data = resp.json()
+            out = []
+            for el in data.get("elements", []):
+                msg = el.get("message", {})
+                text = msg.get("text", "") if isinstance(msg, dict) else ""
+                if not text:
+                    continue
+                author = el.get("actor", "unknown")
+                cid = el.get("id") or el.get("$URN") or f"{share_id}:{len(out)}"
+                out.append({"id": str(cid), "author": str(author), "text": text})
+            return out
+    except Exception as e:
+        logger.error(f"LinkedIn comments error: {e}")
+        return []
+
+
+async def fetch_threads_comments(access_token: str, post_id: str) -> list:
+    """Fetch replies to a Threads post. Returns [] on failure (needs threads_manage_replies scope)."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://graph.threads.net/v1.0/{post_id}/replies",
+                params={
+                    "fields": "id,text,username,timestamp",
+                    "access_token": access_token,
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Threads comments {resp.status_code} for {post_id}: {resp.text[:200]}")
+                return []
+            data = resp.json()
+            out = []
+            for el in data.get("data", []):
+                text = el.get("text", "")
+                if not text:
+                    continue
+                out.append({
+                    "id": str(el.get("id", "")),
+                    "author": el.get("username", "unknown"),
+                    "text": text,
+                })
+            return out
+    except Exception as e:
+        logger.error(f"Threads comments error: {e}")
+        return []
+
+
 async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str = None):
-    """Collect stats for all recently posted content."""
-    from database import get_posted_posts_for_stats, save_post_stats
+    """Collect stats + comment content for all recently posted content."""
+    from database import get_posted_posts_for_stats, save_post_stats, save_post_comment
 
     posts = await get_posted_posts_for_stats(pool)
     if not posts:
@@ -76,7 +143,7 @@ async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str
     updated = 0
 
     for post in posts:
-        # LinkedIn stats
+        # LinkedIn stats + comments
         if linkedin_token and post.get("linkedin_post_id"):
             stats = await fetch_linkedin_stats(linkedin_token, post["linkedin_post_id"])
             if stats:
@@ -85,8 +152,11 @@ async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str
                     stats["likes"], stats["comments"], stats["shares"], stats["views"]
                 )
                 updated += 1
+                if stats["comments"] > 0:
+                    for c in await fetch_linkedin_comments(linkedin_token, post["linkedin_post_id"]):
+                        await save_post_comment(pool, post["id"], "linkedin", c["id"], c["author"], c["text"])
 
-        # Threads stats
+        # Threads stats + comments
         if threads_token and post.get("threads_post_id"):
             stats = await fetch_threads_stats(threads_token, post["threads_post_id"])
             if stats:
@@ -95,6 +165,9 @@ async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str
                     stats["likes"], stats["comments"], stats["shares"], stats["views"]
                 )
                 updated += 1
+                if stats["comments"] > 0:
+                    for c in await fetch_threads_comments(threads_token, post["threads_post_id"]):
+                        await save_post_comment(pool, post["id"], "threads", c["id"], c["author"], c["text"])
 
     logger.info(f"Updated stats for {updated} posts")
     return updated
