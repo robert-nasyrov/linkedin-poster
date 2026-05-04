@@ -142,35 +142,55 @@ async def cmd_relink_li(message: Message):
         await message.answer("✅ Cookies saved. No LinkedIn posts to test against yet.")
         return
 
-    test_post = li_posts[0]
     from linkedin_voyager import fetch_post_page
     from database import set_linkedin_activity_urn
 
-    activity_urn, stats, _ = await fetch_post_page(
-        li_at, jsessionid, test_post["linkedin_post_id"]
-    )
+    # Walk a few posts: many recent ones have 0 engagement so they wouldn't
+    # surface a parser bug vs. a real-zero. Stop on the first non-zero.
+    sample = li_posts[:5]
+    auth_error = False
+    last_activity = None
+    last_stats = None
+    found_engaged = False
 
-    if isinstance(stats, dict) and stats.get("_auth_error"):
+    for tp in sample:
+        activity_urn, stats, _ = await fetch_post_page(
+            li_at, jsessionid, tp["linkedin_post_id"]
+        )
+        if isinstance(stats, dict) and stats.get("_auth_error"):
+            auth_error = True
+            break
+        if activity_urn and not tp.get("linkedin_activity_urn"):
+            await set_linkedin_activity_urn(pool, tp["id"], activity_urn)
+        last_activity = activity_urn or last_activity
+        last_stats = stats or last_stats
+        if stats and (stats["likes"] or stats["comments"] or stats["shares"]):
+            last_activity = activity_urn
+            last_stats = stats
+            found_engaged = True
+            break
+
+    if auth_error:
         await message.answer(
             "⚠️ Cookies saved but LinkedIn rejected them (401/403). "
             "Make sure you copied the exact values from a fresh logged-in session."
         )
         return
 
-    if activity_urn:
-        await set_linkedin_activity_urn(pool, test_post["id"], activity_urn)
-
-    if stats:
+    if last_stats:
+        prefix = "✅ Cookies saved and verified." if found_engaged else \
+                 "✅ Cookies saved. Sample posts had 0 engagement — schema looks fine."
         await message.answer(
-            f"✅ Cookies saved and verified.\n"
-            f"Test post (activity {activity_urn or '?'}): "
-            f"{stats['likes']}❤️ {stats['comments']}💬 {stats['shares']}🔄 {stats['views']}👁\n"
+            f"{prefix}\n"
+            f"Sample (activity {last_activity or '?'}): "
+            f"{last_stats['likes']}❤️ {last_stats['comments']}💬 "
+            f"{last_stats['shares']}🔄 {last_stats['views']}👁\n"
             f"Run /stats to collect for all posts."
         )
     else:
         await message.answer(
-            "⚠️ Cookies saved but couldn't parse engagement from the post page. "
-            "Check Railway logs for the diagnostic dump."
+            "⚠️ Cookies saved but couldn't parse engagement from any sampled post. "
+            "Check Railway logs — the parser logged what fields it actually saw."
         )
 
 
@@ -1262,10 +1282,21 @@ async def handle_free_text(message: Message):
                 )
             return
 
-        # Post edit
+        # Post edit — preserve existing meme/photo (don't drop it on text-only edit)
         post_id = state
-        await update_post_text(pool, post_id, new_text)
-        generated = {"post_text": new_text, "meme": None}
+        existing = await get_post(pool, post_id)
+        existing_meme = None
+        if existing and existing.get("meme_suggestion"):
+            try:
+                existing_meme = (
+                    json.loads(existing["meme_suggestion"])
+                    if isinstance(existing["meme_suggestion"], str)
+                    else existing["meme_suggestion"]
+                )
+            except Exception:
+                existing_meme = None
+        await update_post_text(pool, post_id, new_text, existing_meme)
+        generated = {"post_text": new_text, "meme": existing_meme}
         await message.answer("✅ Post updated! Here's the new version:")
         await send_approval(message.chat.id, post_id, generated)
         return
