@@ -327,26 +327,20 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str,
                 f"first_seen={dict(list(seen.items())[:5])}"
             )
 
-            # Look for engagement keywords anywhere in HTML (not just in JSON).
-            snippets = {}
-            lower = post_html.lower()
-            for kw in ("reactions", "reactioncount", "comments",
-                       "commentcount", "reposts", "shares",
-                       "aria-label", "social", "totalsocial",
-                       "numlikes", "numcomments"):
-                idx = lower.find(kw)
-                if idx >= 0:
-                    snippets[kw] = post_html[max(0, idx-30):idx+250]
-            if snippets:
-                logger.info(f"Post detail keyword snippets for activity:{activity}:")
-                for k, v in snippets.items():
-                    logger.info(f"  [{k}] {v!r}")
-            else:
-                # Nothing engagement-related at all in the HTML
-                logger.info(
-                    f"Post detail page has NO engagement keywords. "
-                    f"First 500 chars: {post_html[:500]!r}"
-                )
+            # The state-keys we want are scoped to the post's activity URN —
+            # `commentCount-urn:li:activity:{activity}`. Find each, dump 2000 chars
+            # after the marker so we can see how SDUI encodes the actual integer.
+            for marker in ("commentCount-urn:li:activity:" + activity,
+                           "reactionCount-urn:li:activity:" + activity,
+                           "repostCount-urn:li:activity:" + activity,
+                           "viewCount-urn:li:activity:" + activity,
+                           "shareCount-urn:li:activity:" + activity,
+                           "impressionsCount-urn:li:activity:" + activity):
+                idx = post_html.find(marker)
+                if idx < 0:
+                    continue
+                window = post_html[idx:idx + 2000]
+                logger.info(f"SDUI state for [{marker.split('-')[0]}]: {window!r}")
 
         # Step 2: pull counts from the author-only analytics page
         analytics_url = (
