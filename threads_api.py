@@ -26,7 +26,7 @@ def get_threads_auth_url() -> str:
     params = {
         "client_id": THREADS_APP_ID,
         "redirect_uri": THREADS_REDIRECT_URI,
-        "scope": "threads_basic,threads_content_publish,threads_manage_replies,threads_read_replies",
+        "scope": "threads_basic,threads_content_publish,threads_manage_replies,threads_read_replies,threads_manage_insights",
         "response_type": "code",
     }
     return f"https://www.threads.net/oauth/authorize?{urlencode(params)}"

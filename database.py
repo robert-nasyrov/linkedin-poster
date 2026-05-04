@@ -76,6 +76,25 @@ async def init_db(pool):
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE(platform, platform_comment_id)
             );
+
+            CREATE TABLE IF NOT EXISTS regen_feedback (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER REFERENCES linkedin_posts(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL DEFAULT 'regen',
+                feedback_text TEXT NOT NULL,
+                draft_text TEXT,
+                source TEXT DEFAULT 'live',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_regen_feedback_created_at
+                ON regen_feedback(created_at DESC);
+        """)
+        # Safe migration if table existed before draft_text was added
+        await conn.execute("""
+            DO $$ BEGIN
+                ALTER TABLE regen_feedback ADD COLUMN IF NOT EXISTS draft_text TEXT;
+            EXCEPTION WHEN others THEN NULL;
+            END $$;
         """)
         # Add columns if they don't exist (safe migration)
         await conn.execute("""
@@ -186,15 +205,47 @@ async def get_approved_posts(pool, limit: int = 5):
 
 
 async def get_rejected_posts(pool, limit: int = 5):
-    """Get recent rejected posts with reasons as negative examples."""
+    """Recent rejected posts WITH a written reason — empty/null rejects are noise."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT post_text, reject_reason FROM linkedin_posts
                WHERE status = 'rejected'
+                 AND reject_reason IS NOT NULL
+                 AND TRIM(reject_reason) <> ''
                ORDER BY created_at DESC LIMIT $1""",
             limit
         )
-        return [{"text": r["post_text"], "reason": r["reject_reason"] or "no reason given"} for r in rows]
+        return [{"text": r["post_text"], "reason": r["reject_reason"]} for r in rows]
+
+
+async def save_regen_feedback(pool, post_id: int, feedback_text: str,
+                               draft_text: str = None):
+    """Save regenerate feedback together with the EXACT draft Robert was reacting to.
+    The post_text on linkedin_posts is overwritten on regen, so we snapshot here."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO regen_feedback
+               (post_id, kind, feedback_text, draft_text, source)
+               VALUES ($1, 'regen', $2, $3, 'live')""",
+            post_id, feedback_text, draft_text
+        )
+
+
+async def get_regen_feedback(pool, limit: int = 10, days: int = 60):
+    """Recent regenerate feedback paired with the original draft text Robert saw.
+    Falls back to current linkedin_posts.post_text if draft_text missing (legacy rows)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT rf.feedback_text,
+                       rf.created_at,
+                       COALESCE(rf.draft_text, lp.post_text) AS draft_text
+                FROM regen_feedback rf
+                LEFT JOIN linkedin_posts lp ON lp.id = rf.post_id
+                WHERE rf.created_at > NOW() - INTERVAL '{int(days)} days'
+                ORDER BY rf.created_at DESC LIMIT $1""",
+            limit
+        )
+        return [dict(r) for r in rows]
 
 
 async def set_reject_reason(pool, post_id: int, reason: str):

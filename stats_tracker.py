@@ -43,29 +43,47 @@ async def fetch_linkedin_stats(access_token: str, share_id: str) -> dict:
 
 
 async def fetch_threads_stats(access_token: str, post_id: str) -> dict:
-    """Fetch likes, replies, reposts, views for a Threads post."""
+    """Fetch Threads engagement metrics via the /insights endpoint.
+
+    likes/views/reposts/quotes/replies are NOT fields on the post object —
+    they are insight metrics. Requires the access token to have
+    `threads_manage_insights` scope (older tokens issued without it will 4xx).
+    """
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
-                f"https://graph.threads.net/v1.0/{post_id}",
+                f"https://graph.threads.net/v1.0/{post_id}/insights",
                 params={
-                    "fields": "likes,replies,reposts,views",
+                    "metric": "views,likes,replies,reposts,quotes",
                     "access_token": access_token,
                 },
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                return {
-                    "likes": data.get("likes", {}).get("summary", {}).get("total_count", 0) if isinstance(data.get("likes"), dict) else data.get("likes", 0),
-                    "comments": data.get("replies", {}).get("summary", {}).get("total_count", 0) if isinstance(data.get("replies"), dict) else data.get("replies", 0),
-                    "shares": data.get("reposts", {}).get("summary", {}).get("total_count", 0) if isinstance(data.get("reposts"), dict) else data.get("reposts", 0),
-                    "views": data.get("views", 0) if isinstance(data.get("views"), int) else 0,
-                }
-            else:
-                logger.warning(f"Threads stats {resp.status_code} for {post_id}: {resp.text[:200]}")
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Threads insights {resp.status_code} for {post_id}: {resp.text[:200]}"
+                )
                 return None
+
+            data = resp.json()
+            metrics = {}
+            for item in data.get("data", []):
+                name = item.get("name")
+                # Threads returns either values:[{value: N}] or total_value:{value: N}
+                val = 0
+                if isinstance(item.get("values"), list) and item["values"]:
+                    val = item["values"][0].get("value", 0) or 0
+                elif isinstance(item.get("total_value"), dict):
+                    val = item["total_value"].get("value", 0) or 0
+                metrics[name] = val
+
+            return {
+                "likes": metrics.get("likes", 0),
+                "comments": metrics.get("replies", 0),
+                "shares": metrics.get("reposts", 0) + metrics.get("quotes", 0),
+                "views": metrics.get("views", 0),
+            }
     except Exception as e:
-        logger.error(f"Threads stats error: {e}")
+        logger.error(f"Threads insights error: {e}")
         return None
 
 

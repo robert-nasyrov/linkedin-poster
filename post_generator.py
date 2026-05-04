@@ -142,6 +142,7 @@ async def build_learning_context(pool) -> str:
     from database import (
         get_approved_posts, get_rejected_posts, get_user_context,
         get_top_posts, get_low_engagement_posts, get_recent_comments,
+        get_regen_feedback,
     )
     from digest_reader import get_digest_context
 
@@ -223,6 +224,25 @@ async def build_learning_context(pool) -> str:
     if rejected:
         examples = "\n---\n".join([f"POST: {r['text'][:200]}...\nWHY REJECTED: {r['reason']}" for r in rejected[:3]])
         sections.append(f"=== POSTS ROBERT REJECTED (avoid this style/tone/topic) ===\n{examples}")
+
+    # REGENERATE FEEDBACK — what Robert said when he asked to redo a draft.
+    # These are stronger taste signals than rejects (he wanted the topic, just wrong execution).
+    # draft_text is the EXACT text Robert was reacting to — without it the feedback is meaningless.
+    try:
+        regen = await get_regen_feedback(pool, limit=10, days=60)
+        if regen:
+            items = []
+            for r in regen:
+                draft = (r.get("draft_text") or "").strip()[:400]
+                txt = (r.get("feedback_text") or "").strip()[:300]
+                items.append(f"DRAFT ROBERT REACTED TO:\n{draft}\n\nWHAT ROBERT SAID: {txt}")
+            sections.append(
+                "=== REGEN FEEDBACK (Robert wanted the topic but disliked the execution — "
+                "study what specifically he objected to in each draft) ===\n"
+                + "\n---\n".join(items)
+            )
+    except Exception as e:
+        logger.warning(f"Regen feedback load failed: {e}")
 
     ctx = await get_user_context(pool, limit=10)
     if ctx:

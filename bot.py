@@ -1117,8 +1117,20 @@ async def handle_free_text(message: Message):
     if message.from_user.id in regen_states:
         post_id = regen_states.pop(message.from_user.id)
         feedback = message.text
-        await message.answer(f"🔄 Got it. Regenerating with your feedback...")
+
+        # Snapshot the draft text BEFORE we regenerate and overwrite it.
+        # The model needs the exact draft Robert was reacting to, not the
+        # regenerated replacement — otherwise the feedback loses all context.
         post_data = await get_post(pool, post_id)
+        original_draft = post_data["post_text"] if post_data else None
+
+        try:
+            from database import save_regen_feedback
+            await save_regen_feedback(pool, post_id, feedback, draft_text=original_draft)
+        except Exception as e:
+            logger.warning(f"Could not save regen feedback: {e}")
+
+        await message.answer(f"🔄 Got it. Regenerating with your feedback...")
         if post_data:
             try:
                 generated = await generate_post_from_topic(
