@@ -164,31 +164,43 @@ def _page_headers() -> dict:
     }
 
 
+async def _fetch_html(client: httpx.AsyncClient, url: str,
+                      li_at: str, jsessionid: str) -> httpx.Response | None:
+    try:
+        return await client.get(
+            url,
+            headers=_page_headers(),
+            cookies=_build_cookies(li_at, jsessionid),
+            timeout=25,
+            follow_redirects=True,
+        )
+    except Exception as e:
+        logger.error(f"HTML fetch transport error for {url}: {e}")
+        return None
+
+
 async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
                           ) -> tuple[str | None, dict | None, dict]:
-    """Fetch the public post page once and pull EVERYTHING we need from it:
-    activity URN + engagement counts. The HTML embeds initial state JSON that
-    LinkedIn's own frontend reads, so the data is reliably present.
+    """Get activity URN + engagement counts.
+
+    Step 1: hit the public post detail page to resolve activity URN.
+    Step 2: hit the AUTHOR-only analytics page for that activity — it has
+    the actual likes/views/comments numbers embedded in HTML, while the
+    public post page loads them via JS after render.
 
     Returns (activity_urn, engagement_dict, debug). On 401/403 returns
     (None, {"_auth_error": True}, debug).
     """
     nid = _numeric_id(share_id)
     debug: dict = {"tried": []}
+    activity: str | None = None
 
     async with httpx.AsyncClient() as client:
+        # Step 1: resolve activity URN from public post page
         for prefix in ("urn:li:share", "urn:li:ugcPost", "urn:li:activity"):
             url = f"https://www.linkedin.com/feed/update/{prefix}:{nid}/"
-            try:
-                resp = await client.get(
-                    url,
-                    headers=_page_headers(),
-                    cookies=_build_cookies(li_at, jsessionid),
-                    timeout=25,
-                    follow_redirects=True,
-                )
-            except Exception as e:
-                debug["tried"].append({"url": url, "error": str(e)})
+            resp = await _fetch_html(client, url, li_at, jsessionid)
+            if resp is None:
                 continue
 
             debug["tried"].append({
@@ -197,47 +209,67 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
             })
 
             if resp.status_code in (401, 403):
-                logger.warning(f"Page auth failed ({resp.status_code}) for {prefix}:{nid}")
                 return (None, {"_auth_error": True}, debug)
             if resp.status_code != 200 or not resp.text:
                 continue
 
-            html = resp.text
-
-            activity = None
             m = _ACTIVITY_RE.search(str(resp.url))
             if m:
                 activity = m.group(1)
             if not activity:
-                m = _ACTIVITY_RE.search(html)
+                m = _ACTIVITY_RE.search(resp.text)
                 if m:
                     activity = m.group(1)
 
-            engagement, seen = _classify_counts(html)
-            if engagement is None and seen:
-                # We saw count-shaped fields but none matched our synonym list —
-                # log what we DID see so we can extend _LIKE_KEYS / etc.
-                # Filter to only fields with words that hint at engagement.
-                hint = {k: v for k, v in seen.items()
-                        if any(t in k.lower() for t in
-                               ("like", "comment", "share", "react", "view",
-                                "impress", "repost", "reshare"))}
-                if hint:
-                    logger.info(f"Engagement-shaped fields in page (unmatched): {hint}")
-                else:
-                    logger.info(
-                        f"No engagement-like fields found. Top numeric fields "
-                        f"seen: {dict(list(seen.items())[:15])}"
-                    )
+            if activity:
+                break
 
-            if activity or engagement:
+        if not activity:
+            logger.warning(f"Couldn't resolve activity URN for share_id={share_id}")
+            return (None, None, debug)
+
+        # Step 2: pull counts from the author-only analytics page
+        analytics_url = (
+            f"https://www.linkedin.com/analytics/post-summary/"
+            f"urn:li:activity:{activity}/"
+        )
+        resp = await _fetch_html(client, analytics_url, li_at, jsessionid)
+        if resp is None:
+            return (activity, None, debug)
+
+        debug["tried"].append({
+            "url": analytics_url, "status": resp.status_code,
+            "final_url": str(resp.url), "body_len": len(resp.text or ""),
+        })
+
+        if resp.status_code in (401, 403):
+            return (activity, {"_auth_error": True}, debug)
+        if resp.status_code != 200 or not resp.text:
+            logger.warning(f"Analytics page {resp.status_code} for activity:{activity}")
+            return (activity, None, debug)
+
+        html = resp.text
+        engagement, seen = _classify_counts(html)
+        if engagement is None and seen:
+            # Diagnostic: surface what fields we DID see if synonyms didn't match
+            hint = {k: v for k, v in seen.items()
+                    if any(t in k.lower() for t in
+                           ("like", "comment", "share", "react", "view",
+                            "impress", "repost", "reshare"))}
+            if hint:
+                logger.info(f"Analytics fields (unmatched synonyms): {hint}")
+            else:
+                top = dict(list(seen.items())[:30])
                 logger.info(
-                    f"Page hit on {prefix}:{nid} — activity={activity}, "
-                    f"engagement={engagement}"
+                    f"Analytics page len={len(html)}, no engagement words. "
+                    f"Sample keys: {top}"
                 )
-                return (activity, engagement, debug)
 
-    return (None, None, debug)
+        logger.info(
+            f"Analytics hit for activity:{activity} — engagement={engagement}, "
+            f"html_len={len(html)}"
+        )
+        return (activity, engagement, debug)
 
 
 async def resolve_activity_urn(li_at: str, jsessionid: str,
