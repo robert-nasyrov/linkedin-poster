@@ -75,19 +75,48 @@ def _build_headers(jsessionid: str) -> dict:
     }
 
 
-def _build_cookies(li_at: str, jsessionid: str) -> dict:
+def _parse_cookie_string(raw: str) -> dict:
+    """Parse 'name=value; name=value; ...' into a dict.
+    Used to forward the user's full cookie jar — analytics page rejects
+    requests with only li_at + JSESSIONID (needs liap, bcookie, lidc, bscookie too).
+    """
+    out: dict = {}
+    if not raw:
+        return out
+    for part in raw.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            value = value.strip()
+            # JSESSIONID is canonically stored quoted; preserve user's literal value
+            # but strip any wrapping whitespace
+            out[name.strip()] = value
+    return out
+
+
+def _build_cookies(li_at: str, jsessionid: str, raw: str = None) -> dict:
+    """Build cookie jar. Prefer the full raw cookie string the user pasted;
+    fall back to li_at + JSESSIONID for backward compat."""
+    if raw:
+        parsed = _parse_cookie_string(raw)
+        if parsed.get("li_at"):
+            return parsed
     js = (jsessionid or "").strip()
-    if not js.startswith('"'):
+    if js and not js.startswith('"'):
         js = f'"{js}"'  # LinkedIn stores JSESSIONID quoted
-    return {"li_at": li_at, "JSESSIONID": js}
+    out = {"li_at": li_at}
+    if js:
+        out["JSESSIONID"] = js
+    return out
 
 
 async def _voyager_get(client: httpx.AsyncClient, url: str,
-                       li_at: str, jsessionid: str) -> httpx.Response:
+                       li_at: str, jsessionid: str,
+                       raw_cookies: str = None) -> httpx.Response:
     return await client.get(
         url,
         headers=_build_headers(jsessionid),
-        cookies=_build_cookies(li_at, jsessionid),
+        cookies=_build_cookies(li_at, jsessionid, raw_cookies),
         timeout=20,
         follow_redirects=False,
     )
@@ -165,12 +194,13 @@ def _page_headers() -> dict:
 
 
 async def _fetch_html(client: httpx.AsyncClient, url: str,
-                      li_at: str, jsessionid: str) -> httpx.Response | None:
+                      li_at: str, jsessionid: str,
+                      raw_cookies: str = None) -> httpx.Response | None:
     try:
         return await client.get(
             url,
             headers=_page_headers(),
-            cookies=_build_cookies(li_at, jsessionid),
+            cookies=_build_cookies(li_at, jsessionid, raw_cookies),
             timeout=25,
             follow_redirects=True,
         )
@@ -179,7 +209,8 @@ async def _fetch_html(client: httpx.AsyncClient, url: str,
         return None
 
 
-async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
+async def fetch_post_page(li_at: str, jsessionid: str, share_id: str,
+                          raw_cookies: str = None
                           ) -> tuple[str | None, dict | None, dict]:
     """Get activity URN + engagement counts.
 
@@ -199,7 +230,7 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
         # Step 1: resolve activity URN from public post page
         for prefix in ("urn:li:share", "urn:li:ugcPost", "urn:li:activity"):
             url = f"https://www.linkedin.com/feed/update/{prefix}:{nid}/"
-            resp = await _fetch_html(client, url, li_at, jsessionid)
+            resp = await _fetch_html(client, url, li_at, jsessionid, raw_cookies)
             if resp is None:
                 continue
 
@@ -233,7 +264,7 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
             f"https://www.linkedin.com/analytics/post-summary/"
             f"urn:li:activity:{activity}/"
         )
-        resp = await _fetch_html(client, analytics_url, li_at, jsessionid)
+        resp = await _fetch_html(client, analytics_url, li_at, jsessionid, raw_cookies)
         if resp is None:
             return (activity, None, debug)
 
@@ -293,9 +324,10 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
 
 
 async def resolve_activity_urn(li_at: str, jsessionid: str,
-                               share_id: str) -> str | None:
+                               share_id: str,
+                               raw_cookies: str = None) -> str | None:
     """Backwards-compat shim — only the URN."""
-    activity, _, _ = await fetch_post_page(li_at, jsessionid, share_id)
+    activity, _, _ = await fetch_post_page(li_at, jsessionid, share_id, raw_cookies)
     return activity
 
 
@@ -328,23 +360,20 @@ def _parse_counts(data: dict) -> dict | None:
     return None
 
 
-async def fetch_engagement(li_at: str, jsessionid: str, post_id: str) -> dict | None:
-    """Get engagement counts. We first try the HTML page (most reliable —
-    LinkedIn's own frontend reads from it). Voyager API is kept as a probe
-    in case the page-embedded state ever stops including counts.
-    """
-    # Primary: HTML page parse
-    _, engagement, _ = await fetch_post_page(li_at, jsessionid, post_id)
+async def fetch_engagement(li_at: str, jsessionid: str, post_id: str,
+                           raw_cookies: str = None) -> dict | None:
+    """Get engagement counts via the analytics page parse path."""
+    _, engagement, _ = await fetch_post_page(li_at, jsessionid, post_id, raw_cookies)
     if engagement:
         return engagement
 
-    # Fallback: Voyager updateV2 (may 404 on modern LinkedIn but cheap to try)
+    # Fallback: Voyager updateV2 (modern LinkedIn 404s here but harmless to try)
     async with httpx.AsyncClient() as client:
         for urn in _urn_candidates(post_id):
             encoded = quote(urn, safe="")
             url = f"https://www.linkedin.com/voyager/api/feed/updateV2/{encoded}"
             try:
-                resp = await _voyager_get(client, url, li_at, jsessionid)
+                resp = await _voyager_get(client, url, li_at, jsessionid, raw_cookies)
             except Exception:
                 continue
             if resp.status_code in (401, 403):
@@ -360,7 +389,8 @@ async def fetch_engagement(li_at: str, jsessionid: str, post_id: str) -> dict | 
 
 
 async def fetch_comments(li_at: str, jsessionid: str, post_id: str,
-                         limit: int = 20) -> list[dict]:
+                         limit: int = 20,
+                         raw_cookies: str = None) -> list[dict]:
     """Try each URN namespace for the Voyager comments endpoint.
     Returns [] on any error."""
     async with httpx.AsyncClient() as client:
@@ -371,7 +401,7 @@ async def fetch_comments(li_at: str, jsessionid: str, post_id: str,
                 f"?numComments={int(limit)}&q=updateV2&start=0&updateId={encoded}"
             )
             try:
-                resp = await _voyager_get(client, url, li_at, jsessionid)
+                resp = await _voyager_get(client, url, li_at, jsessionid, raw_cookies)
             except Exception as e:
                 logger.error(f"Voyager comments transport error for {urn}: {e}")
                 continue

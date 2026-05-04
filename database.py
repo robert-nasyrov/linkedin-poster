@@ -93,6 +93,7 @@ async def init_db(pool):
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 li_at TEXT NOT NULL,
                 jsessionid TEXT,
+                raw_cookies TEXT,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
@@ -109,6 +110,7 @@ async def init_db(pool):
                 ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS reject_reason TEXT;
                 ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS threads_post_id TEXT;
                 ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS linkedin_activity_urn TEXT;
+                ALTER TABLE linkedin_cookies ADD COLUMN IF NOT EXISTS raw_cookies TEXT;
             EXCEPTION WHEN others THEN NULL;
             END $$;
         """)
@@ -392,14 +394,15 @@ async def save_post_comment(pool, post_id: int, platform: str, platform_comment_
         )
 
 
-async def save_linkedin_cookies(pool, li_at: str, jsessionid: str = None):
+async def save_linkedin_cookies(pool, li_at: str, jsessionid: str = None,
+                                 raw_cookies: str = None):
     async with pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO linkedin_cookies (id, li_at, jsessionid, updated_at)
-               VALUES (1, $1, $2, NOW())
+            """INSERT INTO linkedin_cookies (id, li_at, jsessionid, raw_cookies, updated_at)
+               VALUES (1, $1, $2, $3, NOW())
                ON CONFLICT (id) DO UPDATE
-               SET li_at = $1, jsessionid = $2, updated_at = NOW()""",
-            li_at, jsessionid
+               SET li_at = $1, jsessionid = $2, raw_cookies = $3, updated_at = NOW()""",
+            li_at, jsessionid, raw_cookies
         )
 
 

@@ -149,7 +149,8 @@ async def fetch_threads_comments(access_token: str, post_id: str) -> list:
         return []
 
 
-async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid) -> tuple[bool, bool]:
+async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid,
+                                         raw_cookies=None) -> tuple[bool, bool]:
     """Fallback path for LinkedIn engagement using browser cookies.
     Returns (collected, auth_error). auth_error=True means cookies are stale —
     caller should stop calling Voyager and notify the user.
@@ -161,7 +162,7 @@ async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid) -> tuple[
     from linkedin_voyager import fetch_post_page, fetch_comments, jitter
 
     activity_urn, stats, _ = await fetch_post_page(
-        li_at, jsessionid, post["linkedin_post_id"]
+        li_at, jsessionid, post["linkedin_post_id"], raw_cookies
     )
 
     if isinstance(stats, dict) and stats.get("_auth_error"):
@@ -182,7 +183,7 @@ async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid) -> tuple[
 
     if stats["comments"] > 0 and activity_urn:
         target = f"urn:li:activity:{activity_urn}"
-        for c in await fetch_comments(li_at, jsessionid, target):
+        for c in await fetch_comments(li_at, jsessionid, target, raw_cookies=raw_cookies):
             await save_post_comment(
                 pool, post["id"], "linkedin", c["id"], c["author"], c["text"]
             )
@@ -212,6 +213,7 @@ async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str
     cookies = await get_linkedin_cookies(pool)
     li_at = cookies.get("li_at") if cookies else None
     jsessionid = cookies.get("jsessionid") if cookies else None
+    raw_cookies = cookies.get("raw_cookies") if cookies else None
 
     updated = 0
     li_cookies_stale = False
@@ -237,7 +239,7 @@ async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str
 
             if not collected and li_at and not li_cookies_stale:
                 ok, auth_err = await _collect_linkedin_via_voyager(
-                    pool, post, li_at, jsessionid
+                    pool, post, li_at, jsessionid, raw_cookies
                 )
                 if ok:
                     updated += 1

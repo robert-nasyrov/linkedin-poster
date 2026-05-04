@@ -97,12 +97,9 @@ async def cmd_start(message: Message):
 
 @router.message(Command("relink_li"))
 async def cmd_relink_li(message: Message):
-    """Save fresh LinkedIn cookies for the Voyager engagement fallback.
-
-    Usage: paste either of these formats after the command:
-      /relink_li li_at=AQED...; JSESSIONID="ajax:1234..."
-      /relink_li li_at=AQED... JSESSIONID=ajax:1234...
-    Cookies are extracted from Chrome DevTools → Application → Cookies → linkedin.com.
+    """Save fresh LinkedIn cookies. Best UX: paste the FULL cookie string
+    so analytics page (which needs liap, bcookie, lidc, bscookie beyond
+    li_at + JSESSIONID) doesn't redirect to login.
     """
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
@@ -110,12 +107,16 @@ async def cmd_relink_li(message: Message):
     raw = (message.text or "").replace("/relink_li", "", 1).strip()
     if not raw:
         await message.answer(
-            "Usage: /relink_li li_at=...; JSESSIONID=\"ajax:...\"\n\n"
-            "How to get them:\n"
+            "📋 Paste your full LinkedIn cookie jar after /relink_li.\n\n"
+            "Best way to get it:\n"
             "1. Open linkedin.com in Chrome (logged in)\n"
-            "2. DevTools (F12) → Application → Cookies → https://www.linkedin.com\n"
-            "3. Copy values of li_at and JSESSIONID\n"
-            "4. Paste them after /relink_li"
+            "2. F12 → Application → Cookies → https://www.linkedin.com\n"
+            "3. Click any row, Ctrl+A to select all → right-click → "
+            "  Copy as cookie string. (Chrome 118+)\n"
+            "  Or manually copy: li_at, JSESSIONID, liap, bcookie, "
+            "  bscookie, lidc, then paste them as: \n"
+            "  name1=value1; name2=value2; ...\n"
+            "4. Send: /relink_li <that string>"
         )
         return
 
@@ -130,8 +131,15 @@ async def cmd_relink_li(message: Message):
     li_at = li_at_match.group(1).strip()
     jsessionid = js_match.group(1).strip() if js_match else None
 
+    # Surface which cookies we got — helps debug "missing cookie" cases
+    from linkedin_voyager import _parse_cookie_string
+    parsed = _parse_cookie_string(raw)
+    important = ("li_at", "JSESSIONID", "liap", "bcookie", "bscookie", "lidc", "li_g_recent_logout")
+    found = [c for c in important if c in parsed]
+    missing = [c for c in important if c not in parsed]
+
     from database import save_linkedin_cookies
-    await save_linkedin_cookies(pool, li_at, jsessionid)
+    await save_linkedin_cookies(pool, li_at, jsessionid, raw_cookies=raw)
 
     # Quick verification: try fetching engagement on the latest posted post
     from database import get_posted_posts_for_stats
@@ -155,7 +163,7 @@ async def cmd_relink_li(message: Message):
 
     for tp in sample:
         activity_urn, stats, _ = await fetch_post_page(
-            li_at, jsessionid, tp["linkedin_post_id"]
+            li_at, jsessionid, tp["linkedin_post_id"], raw_cookies=raw
         )
         if isinstance(stats, dict) and stats.get("_auth_error"):
             auth_error = True
@@ -177,11 +185,17 @@ async def cmd_relink_li(message: Message):
         )
         return
 
+    cookie_summary = (
+        f"Cookies seen: {', '.join(found) or 'none of the important ones'}\n"
+        + (f"⚠️ Missing: {', '.join(missing)}\n" if missing else "")
+    )
+
     if last_stats:
         prefix = "✅ Cookies saved and verified." if found_engaged else \
                  "✅ Cookies saved. Sample posts had 0 engagement — schema looks fine."
         await message.answer(
             f"{prefix}\n"
+            f"{cookie_summary}"
             f"Sample (activity {last_activity or '?'}): "
             f"{last_stats['likes']}❤️ {last_stats['comments']}💬 "
             f"{last_stats['shares']}🔄 {last_stats['views']}👁\n"
@@ -189,8 +203,10 @@ async def cmd_relink_li(message: Message):
         )
     else:
         await message.answer(
-            "⚠️ Cookies saved but couldn't parse engagement from any sampled post. "
-            "Check Railway logs — the parser logged what fields it actually saw."
+            f"⚠️ Cookies saved but couldn't read engagement from any sampled post.\n"
+            f"{cookie_summary}"
+            f"Check Railway logs — the parser logged whether the analytics page "
+            f"redirected to login or returned data."
         )
 
 
