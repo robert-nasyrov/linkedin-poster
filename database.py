@@ -108,6 +108,7 @@ async def init_db(pool):
             DO $$ BEGIN
                 ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS reject_reason TEXT;
                 ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS threads_post_id TEXT;
+                ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS linkedin_activity_urn TEXT;
             EXCEPTION WHEN others THEN NULL;
             END $$;
         """)
@@ -328,7 +329,8 @@ async def get_posted_posts_for_stats(pool):
     """Get posts that have been published and need stats refresh."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT id, post_text, linkedin_post_id, threads_post_id, posted_at
+            """SELECT id, post_text, linkedin_post_id, threads_post_id,
+                      linkedin_activity_urn, posted_at
                FROM linkedin_posts
                WHERE status = 'posted'
                AND posted_at > NOW() - INTERVAL '30 days'
@@ -336,6 +338,14 @@ async def get_posted_posts_for_stats(pool):
                LIMIT 30"""
         )
         return [dict(r) for r in rows]
+
+
+async def set_linkedin_activity_urn(pool, post_id: int, activity_urn: str):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE linkedin_posts SET linkedin_activity_urn = $1 WHERE id = $2",
+            activity_urn, post_id
+        )
 
 
 async def get_top_posts(pool, limit: int = 5):

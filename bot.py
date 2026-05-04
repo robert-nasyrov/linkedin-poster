@@ -144,11 +144,30 @@ async def cmd_relink_li(message: Message):
         return
 
     test_post = li_posts[0]
-    stats = await fetch_engagement(li_at, jsessionid, test_post["linkedin_post_id"])
+    activity_urn = test_post.get("linkedin_activity_urn")
+    if not activity_urn:
+        from linkedin_voyager import resolve_activity_urn
+        from database import set_linkedin_activity_urn
+        activity_urn = await resolve_activity_urn(
+            li_at, jsessionid, test_post["linkedin_post_id"]
+        )
+        if activity_urn:
+            await set_linkedin_activity_urn(pool, test_post["id"], activity_urn)
+
+    if not activity_urn:
+        await message.answer(
+            "⚠️ Cookies saved but couldn't resolve the activity URN for the test post. "
+            "The post might be deleted or the cookies don't have feed access. "
+            "Check Railway logs."
+        )
+        return
+
+    stats = await fetch_engagement(li_at, jsessionid, f"urn:li:activity:{activity_urn}")
     if stats and not stats.get("_auth_error"):
         await message.answer(
             f"✅ Cookies saved and verified.\n"
-            f"Test post: {stats['likes']}❤️ {stats['comments']}💬 {stats['shares']}🔄\n"
+            f"Test post (activity {activity_urn}): "
+            f"{stats['likes']}❤️ {stats['comments']}💬 {stats['shares']}🔄\n"
             f"Run /stats to collect for all posts."
         )
     elif stats and stats.get("_auth_error"):

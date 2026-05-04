@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from urllib.parse import quote
 
 import httpx
@@ -90,6 +91,52 @@ async def _voyager_get(client: httpx.AsyncClient, url: str,
         timeout=20,
         follow_redirects=False,
     )
+
+
+_ACTIVITY_RE = re.compile(r"urn[:%]li[:%]activity[:%](\d+)")
+
+
+async def resolve_activity_urn(li_at: str, jsessionid: str,
+                               share_id: str) -> str | None:
+    """LinkedIn share/ugcPost numeric IDs do NOT match activity URN IDs.
+    To find the activity URN we hit the public post page and follow redirects;
+    the final URL (or page body) reveals the canonical urn:li:activity:NNN.
+    """
+    nid = _numeric_id(share_id)
+    page_headers = {
+        "user-agent": _BROWSER_UA,
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "referer": "https://www.linkedin.com/feed/",
+    }
+
+    async with httpx.AsyncClient() as client:
+        for prefix in ("urn:li:share", "urn:li:ugcPost", "urn:li:activity"):
+            url = f"https://www.linkedin.com/feed/update/{prefix}:{nid}/"
+            try:
+                resp = await client.get(
+                    url,
+                    headers=page_headers,
+                    cookies=_build_cookies(li_at, jsessionid),
+                    timeout=20,
+                    follow_redirects=True,
+                )
+            except Exception as e:
+                logger.error(f"Activity URN resolve transport error for {prefix}:{nid}: {e}")
+                continue
+
+            # Check final URL first (redirect target often carries the activity URN)
+            m = _ACTIVITY_RE.search(str(resp.url))
+            if m:
+                return m.group(1)
+
+            # Fallback: page body usually carries the canonical URN in metadata
+            if resp.status_code == 200 and resp.text:
+                m = _ACTIVITY_RE.search(resp.text)
+                if m:
+                    return m.group(1)
+
+    return None
 
 
 def _parse_counts(data: dict) -> dict | None:

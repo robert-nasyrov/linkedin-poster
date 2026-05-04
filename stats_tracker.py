@@ -152,11 +152,30 @@ async def fetch_threads_comments(access_token: str, post_id: str) -> list:
 async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid) -> tuple[bool, bool]:
     """Fallback path for LinkedIn engagement using browser cookies.
     Returns (collected, auth_error). auth_error=True means cookies are stale —
-    caller should stop calling Voyager and notify the user."""
-    from database import save_post_stats, save_post_comment
-    from linkedin_voyager import fetch_engagement, fetch_comments, jitter
+    caller should stop calling Voyager and notify the user.
 
-    stats = await fetch_engagement(li_at, jsessionid, post["linkedin_post_id"])
+    LinkedIn's share/ugcPost numeric IDs do NOT equal activity URN IDs.
+    On first call for a post we resolve the activity URN via redirect
+    crawl and cache it on linkedin_posts so subsequent calls are 1 request.
+    """
+    from database import save_post_stats, save_post_comment, set_linkedin_activity_urn
+    from linkedin_voyager import (
+        fetch_engagement, fetch_comments, resolve_activity_urn, jitter,
+    )
+
+    activity_urn = post.get("linkedin_activity_urn")
+    if not activity_urn:
+        resolved = await resolve_activity_urn(li_at, jsessionid, post["linkedin_post_id"])
+        if resolved:
+            activity_urn = resolved
+            await set_linkedin_activity_urn(pool, post["id"], activity_urn)
+            logger.info(f"Resolved activity URN {activity_urn} for post #{post['id']}")
+        else:
+            logger.warning(f"Could not resolve activity URN for post #{post['id']}")
+            return (False, False)
+
+    target = f"urn:li:activity:{activity_urn}"
+    stats = await fetch_engagement(li_at, jsessionid, target)
     if stats and stats.get("_auth_error"):
         return (False, True)
     if not stats:
@@ -167,7 +186,7 @@ async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid) -> tuple[
         stats["likes"], stats["comments"], stats["shares"], stats["views"]
     )
     if stats["comments"] > 0:
-        for c in await fetch_comments(li_at, jsessionid, post["linkedin_post_id"]):
+        for c in await fetch_comments(li_at, jsessionid, target):
             await save_post_comment(
                 pool, post["id"], "linkedin", c["id"], c["author"], c["text"]
             )
