@@ -149,32 +149,86 @@ async def fetch_threads_comments(access_token: str, post_id: str) -> list:
         return []
 
 
+async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid) -> tuple[bool, bool]:
+    """Fallback path for LinkedIn engagement using browser cookies.
+    Returns (collected, auth_error). auth_error=True means cookies are stale —
+    caller should stop calling Voyager and notify the user."""
+    from database import save_post_stats, save_post_comment
+    from linkedin_voyager import fetch_engagement, fetch_comments, jitter
+
+    stats = await fetch_engagement(li_at, jsessionid, post["linkedin_post_id"])
+    if stats and stats.get("_auth_error"):
+        return (False, True)
+    if not stats:
+        return (False, False)
+
+    await save_post_stats(
+        pool, post["id"], "linkedin", post["linkedin_post_id"],
+        stats["likes"], stats["comments"], stats["shares"], stats["views"]
+    )
+    if stats["comments"] > 0:
+        for c in await fetch_comments(li_at, jsessionid, post["linkedin_post_id"]):
+            await save_post_comment(
+                pool, post["id"], "linkedin", c["id"], c["author"], c["text"]
+            )
+    await jitter()
+    return (True, False)
+
+
 async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str = None):
-    """Collect stats + comment content for all recently posted content."""
-    from database import get_posted_posts_for_stats, save_post_stats, save_post_comment
+    """Collect stats + comment content for all recently posted content.
+
+    LinkedIn flow: try the official `/v2/socialActions` endpoint first; on
+    failure (typical for personal apps in 2024+), fall back to Voyager via
+    the user's browser cookies if any are stored. If Voyager auth breaks,
+    skip remaining LinkedIn requests and surface the failure.
+    """
+    from database import (
+        get_posted_posts_for_stats, save_post_stats, save_post_comment,
+        get_linkedin_cookies,
+    )
 
     posts = await get_posted_posts_for_stats(pool)
     if not posts:
         logger.info("No posts to collect stats for")
-        return
+        return {"updated": 0, "li_cookies_stale": False}
+
+    cookies = await get_linkedin_cookies(pool)
+    li_at = cookies.get("li_at") if cookies else None
+    jsessionid = cookies.get("jsessionid") if cookies else None
 
     updated = 0
+    li_cookies_stale = False
 
     for post in posts:
-        # LinkedIn stats + comments
-        if linkedin_token and post.get("linkedin_post_id"):
-            stats = await fetch_linkedin_stats(linkedin_token, post["linkedin_post_id"])
-            if stats:
-                await save_post_stats(
-                    pool, post["id"], "linkedin", post["linkedin_post_id"],
-                    stats["likes"], stats["comments"], stats["shares"], stats["views"]
-                )
-                updated += 1
-                if stats["comments"] > 0:
-                    for c in await fetch_linkedin_comments(linkedin_token, post["linkedin_post_id"]):
-                        await save_post_comment(pool, post["id"], "linkedin", c["id"], c["author"], c["text"])
+        # LinkedIn — official API first, Voyager fallback
+        if post.get("linkedin_post_id"):
+            collected = False
+            if linkedin_token:
+                stats = await fetch_linkedin_stats(linkedin_token, post["linkedin_post_id"])
+                if stats:
+                    await save_post_stats(
+                        pool, post["id"], "linkedin", post["linkedin_post_id"],
+                        stats["likes"], stats["comments"], stats["shares"], stats["views"]
+                    )
+                    updated += 1
+                    collected = True
+                    if stats["comments"] > 0:
+                        for c in await fetch_linkedin_comments(linkedin_token, post["linkedin_post_id"]):
+                            await save_post_comment(
+                                pool, post["id"], "linkedin", c["id"], c["author"], c["text"]
+                            )
 
-        # Threads stats + comments
+            if not collected and li_at and not li_cookies_stale:
+                ok, auth_err = await _collect_linkedin_via_voyager(
+                    pool, post, li_at, jsessionid
+                )
+                if ok:
+                    updated += 1
+                if auth_err:
+                    li_cookies_stale = True
+
+        # Threads — only one path, Graph API insights
         if threads_token and post.get("threads_post_id"):
             stats = await fetch_threads_stats(threads_token, post["threads_post_id"])
             if stats:
@@ -185,7 +239,9 @@ async def collect_all_stats(pool, linkedin_token: str = None, threads_token: str
                 updated += 1
                 if stats["comments"] > 0:
                     for c in await fetch_threads_comments(threads_token, post["threads_post_id"]):
-                        await save_post_comment(pool, post["id"], "threads", c["id"], c["author"], c["text"])
+                        await save_post_comment(
+                            pool, post["id"], "threads", c["id"], c["author"], c["text"]
+                        )
 
-    logger.info(f"Updated stats for {updated} posts")
-    return updated
+    logger.info(f"Updated stats for {updated} posts (li_cookies_stale={li_cookies_stale})")
+    return {"updated": updated, "li_cookies_stale": li_cookies_stale}

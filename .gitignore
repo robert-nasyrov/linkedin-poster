@@ -4,5 +4,6 @@ __pycache__/
 .env
 .env.*
 backfill_preview.json
+backfill.sql
 *.session
 *.session-journal

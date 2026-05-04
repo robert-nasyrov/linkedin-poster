@@ -95,6 +95,74 @@ async def cmd_start(message: Message):
     )
 
 
+@router.message(Command("relink_li"))
+async def cmd_relink_li(message: Message):
+    """Save fresh LinkedIn cookies for the Voyager engagement fallback.
+
+    Usage: paste either of these formats after the command:
+      /relink_li li_at=AQED...; JSESSIONID="ajax:1234..."
+      /relink_li li_at=AQED... JSESSIONID=ajax:1234...
+    Cookies are extracted from Chrome DevTools → Application → Cookies → linkedin.com.
+    """
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    raw = (message.text or "").replace("/relink_li", "", 1).strip()
+    if not raw:
+        await message.answer(
+            "Usage: /relink_li li_at=...; JSESSIONID=\"ajax:...\"\n\n"
+            "How to get them:\n"
+            "1. Open linkedin.com in Chrome (logged in)\n"
+            "2. DevTools (F12) → Application → Cookies → https://www.linkedin.com\n"
+            "3. Copy values of li_at and JSESSIONID\n"
+            "4. Paste them after /relink_li"
+        )
+        return
+
+    import re
+    li_at_match = re.search(r"li_at\s*=\s*([^\s;]+)", raw)
+    js_match = re.search(r'JSESSIONID\s*=\s*"?([^\s;"]+)"?', raw, re.IGNORECASE)
+
+    if not li_at_match:
+        await message.answer("❌ Couldn't find li_at in your message.")
+        return
+
+    li_at = li_at_match.group(1).strip()
+    jsessionid = js_match.group(1).strip() if js_match else None
+
+    from database import save_linkedin_cookies
+    await save_linkedin_cookies(pool, li_at, jsessionid)
+
+    # Quick verification: try fetching engagement on the latest posted post
+    from database import get_posted_posts_for_stats
+    from linkedin_voyager import fetch_engagement
+    posts = await get_posted_posts_for_stats(pool)
+    li_posts = [p for p in posts if p.get("linkedin_post_id")]
+
+    if not li_posts:
+        await message.answer("✅ Cookies saved. No LinkedIn posts to test against yet.")
+        return
+
+    test_post = li_posts[0]
+    stats = await fetch_engagement(li_at, jsessionid, test_post["linkedin_post_id"])
+    if stats and not stats.get("_auth_error"):
+        await message.answer(
+            f"✅ Cookies saved and verified.\n"
+            f"Test post: {stats['likes']}❤️ {stats['comments']}💬 {stats['shares']}🔄\n"
+            f"Run /stats to collect for all posts."
+        )
+    elif stats and stats.get("_auth_error"):
+        await message.answer(
+            "⚠️ Cookies saved but LinkedIn rejected them (401/403). "
+            "Make sure you copied the exact values from a fresh logged-in session."
+        )
+    else:
+        await message.answer(
+            "⚠️ Cookies saved but the test request failed. "
+            "Check Railway logs for the exact error and re-paste if needed."
+        )
+
+
 @router.message(Command("connect"))
 async def cmd_connect(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
@@ -173,9 +241,14 @@ async def cmd_stats(message: Message):
         threads_data = await get_threads_token_or_env(pool)
         li_access = li_token["access_token"] if li_token else None
         th_access = threads_data["access_token"] if threads_data else None
-        updated = await collect_all_stats(pool, li_access, th_access)
-        if updated:
-            top = await get_top_posts(pool, limit=5)
+        result = await collect_all_stats(pool, li_access, th_access)
+        if isinstance(result, dict):
+            if result.get("updated"):
+                top = await get_top_posts(pool, limit=5)
+            if result.get("li_cookies_stale"):
+                await message.answer(
+                    "⚠️ LinkedIn cookies expired. Refresh with /relink_li."
+                )
 
     if not top:
         await message.answer("📊 No engagement data yet. Stats collect daily at 21:00.")
@@ -1241,9 +1314,15 @@ async def scheduled_stats_collection():
                 li_access = li_token["access_token"] if li_token else None
                 th_access = threads_data["access_token"] if threads_data else None
 
-                updated = await collect_all_stats(pool, li_access, th_access)
-                if updated:
-                    logger.info(f"Stats updated for {updated} posts")
+                result = await collect_all_stats(pool, li_access, th_access)
+                if isinstance(result, dict) and result.get("li_cookies_stale"):
+                    try:
+                        await bot.send_message(
+                            TELEGRAM_ADMIN_ID,
+                            "⚠️ LinkedIn cookies expired. Refresh with /relink_li."
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error(f"Stats collection error: {e}")
 

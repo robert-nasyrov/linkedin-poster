@@ -88,6 +88,13 @@ async def init_db(pool):
             );
             CREATE INDEX IF NOT EXISTS idx_regen_feedback_created_at
                 ON regen_feedback(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS linkedin_cookies (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                li_at TEXT NOT NULL,
+                jsessionid TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
         """)
         # Safe migration if table existed before draft_text was added
         await conn.execute("""
@@ -373,6 +380,23 @@ async def save_post_comment(pool, post_id: int, platform: str, platform_comment_
                ON CONFLICT (platform, platform_comment_id) DO NOTHING""",
             post_id, platform, platform_comment_id, author, text
         )
+
+
+async def save_linkedin_cookies(pool, li_at: str, jsessionid: str = None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO linkedin_cookies (id, li_at, jsessionid, updated_at)
+               VALUES (1, $1, $2, NOW())
+               ON CONFLICT (id) DO UPDATE
+               SET li_at = $1, jsessionid = $2, updated_at = NOW()""",
+            li_at, jsessionid
+        )
+
+
+async def get_linkedin_cookies(pool):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM linkedin_cookies WHERE id = 1")
+        return dict(row) if row else None
 
 
 async def get_recent_comments(pool, limit: int = 10, days: int = 30):
