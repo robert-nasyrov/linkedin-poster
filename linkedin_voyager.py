@@ -318,31 +318,35 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str,
                     f"for activity:{activity}: {engagement}"
                 )
                 return (activity, engagement, debug)
-            elif seen:
-                hint = {k: v for k, v in seen.items()
-                        if k.startswith(("aria.", "text."))
-                        or any(t in k.lower() for t in
-                               ("like", "comment", "share", "react", "view",
-                                "impress", "repost"))}
-                if hint:
-                    logger.info(f"Post detail engagement-shaped fields: {hint}")
-                else:
-                    # No engagement keywords at all — likely SPA shell.
-                    # Dump 200-char window around any of these keywords, even if no number nearby
-                    snippets = {}
-                    lower = post_html.lower()
-                    for kw in ("reactions", "reactioncount", "comments",
-                               "commentcount", "reposts", "shares",
-                               "aria-label", "social"):
-                        idx = lower.find(kw)
-                        if idx >= 0:
-                            snippets[kw] = post_html[max(0, idx-30):idx+200]
-                    if snippets:
-                        logger.info("Post detail keyword snippets:")
-                        for k, v in snippets.items():
-                            logger.info(f"  [{k}] {v!r}")
-                    else:
-                        logger.info(f"Post detail page has no engagement words. len={len(post_html)}")
+
+            # Engagement is None. Always log diagnostic so we can see what's there.
+            logger.info(
+                f"POST DETAIL DIAG for activity:{activity}: "
+                f"html_len={len(post_html)}, "
+                f"json_count_fields={len(seen)}, "
+                f"first_seen={dict(list(seen.items())[:5])}"
+            )
+
+            # Look for engagement keywords anywhere in HTML (not just in JSON).
+            snippets = {}
+            lower = post_html.lower()
+            for kw in ("reactions", "reactioncount", "comments",
+                       "commentcount", "reposts", "shares",
+                       "aria-label", "social", "totalsocial",
+                       "numlikes", "numcomments"):
+                idx = lower.find(kw)
+                if idx >= 0:
+                    snippets[kw] = post_html[max(0, idx-30):idx+250]
+            if snippets:
+                logger.info(f"Post detail keyword snippets for activity:{activity}:")
+                for k, v in snippets.items():
+                    logger.info(f"  [{k}] {v!r}")
+            else:
+                # Nothing engagement-related at all in the HTML
+                logger.info(
+                    f"Post detail page has NO engagement keywords. "
+                    f"First 500 chars: {post_html[:500]!r}"
+                )
 
         # Step 2: pull counts from the author-only analytics page
         analytics_url = (
