@@ -94,21 +94,32 @@ async def _voyager_get(client: httpx.AsyncClient, url: str,
 
 
 _ACTIVITY_RE = re.compile(r"urn[:%]li[:%]activity[:%](\d+)")
+_NUMLIKES_RE = re.compile(r'"numLikes"\s*:\s*(\d+)')
+_NUMCOMMENTS_RE = re.compile(r'"numComments"\s*:\s*(\d+)')
+_NUMSHARES_RE = re.compile(r'"numShares"\s*:\s*(\d+)')
+_NUMVIEWS_RE = re.compile(r'"numImpressions"\s*:\s*(\d+)|"numViews"\s*:\s*(\d+)')
 
 
-async def resolve_activity_urn(li_at: str, jsessionid: str,
-                               share_id: str) -> str | None:
-    """LinkedIn share/ugcPost numeric IDs do NOT match activity URN IDs.
-    To find the activity URN we hit the public post page and follow redirects;
-    the final URL (or page body) reveals the canonical urn:li:activity:NNN.
-    """
-    nid = _numeric_id(share_id)
-    page_headers = {
+def _page_headers() -> dict:
+    return {
         "user-agent": _BROWSER_UA,
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "en-US,en;q=0.9",
         "referer": "https://www.linkedin.com/feed/",
     }
+
+
+async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
+                          ) -> tuple[str | None, dict | None, dict]:
+    """Fetch the public post page once and pull EVERYTHING we need from it:
+    activity URN + engagement counts. The HTML embeds initial state JSON that
+    LinkedIn's own frontend reads, so the data is reliably present.
+
+    Returns (activity_urn, engagement_dict, debug). On 401/403 returns
+    (None, {"_auth_error": True}, debug).
+    """
+    nid = _numeric_id(share_id)
+    debug: dict = {"tried": []}
 
     async with httpx.AsyncClient() as client:
         for prefix in ("urn:li:share", "urn:li:ugcPost", "urn:li:activity"):
@@ -116,27 +127,65 @@ async def resolve_activity_urn(li_at: str, jsessionid: str,
             try:
                 resp = await client.get(
                     url,
-                    headers=page_headers,
+                    headers=_page_headers(),
                     cookies=_build_cookies(li_at, jsessionid),
-                    timeout=20,
+                    timeout=25,
                     follow_redirects=True,
                 )
             except Exception as e:
-                logger.error(f"Activity URN resolve transport error for {prefix}:{nid}: {e}")
+                debug["tried"].append({"url": url, "error": str(e)})
                 continue
 
-            # Check final URL first (redirect target often carries the activity URN)
+            debug["tried"].append({
+                "url": url, "status": resp.status_code,
+                "final_url": str(resp.url), "body_len": len(resp.text or ""),
+            })
+
+            if resp.status_code in (401, 403):
+                logger.warning(f"Page auth failed ({resp.status_code}) for {prefix}:{nid}")
+                return (None, {"_auth_error": True}, debug)
+            if resp.status_code != 200 or not resp.text:
+                continue
+
+            html = resp.text
+
+            activity = None
             m = _ACTIVITY_RE.search(str(resp.url))
             if m:
-                return m.group(1)
-
-            # Fallback: page body usually carries the canonical URN in metadata
-            if resp.status_code == 200 and resp.text:
-                m = _ACTIVITY_RE.search(resp.text)
+                activity = m.group(1)
+            if not activity:
+                m = _ACTIVITY_RE.search(html)
                 if m:
-                    return m.group(1)
+                    activity = m.group(1)
 
-    return None
+            engagement: dict | None = None
+            likes_m = _NUMLIKES_RE.search(html)
+            comments_m = _NUMCOMMENTS_RE.search(html)
+            shares_m = _NUMSHARES_RE.search(html)
+            views_m = _NUMVIEWS_RE.search(html)
+            if likes_m or comments_m or shares_m:
+                v = views_m.group(1) or views_m.group(2) if views_m else 0
+                engagement = {
+                    "likes": int(likes_m.group(1)) if likes_m else 0,
+                    "comments": int(comments_m.group(1)) if comments_m else 0,
+                    "shares": int(shares_m.group(1)) if shares_m else 0,
+                    "views": int(v or 0),
+                }
+
+            if activity or engagement:
+                logger.info(
+                    f"Page hit on {prefix}:{nid} — activity={activity}, engagement={engagement}"
+                )
+                return (activity, engagement, debug)
+
+    return (None, None, debug)
+
+
+async def resolve_activity_urn(li_at: str, jsessionid: str,
+                               share_id: str) -> str | None:
+    """Backwards-compat shim — only the URN."""
+    activity, _, _ = await fetch_post_page(li_at, jsessionid, share_id)
+    return activity
 
 
 def _parse_counts(data: dict) -> dict | None:
@@ -169,46 +218,33 @@ def _parse_counts(data: dict) -> dict | None:
 
 
 async def fetch_engagement(li_at: str, jsessionid: str, post_id: str) -> dict | None:
-    """Try each URN namespace until Voyager returns 200, then parse counts.
-    Returns {"_auth_error": True} on 401/403, None on other failures."""
-    last_status = None
-    last_body = ""
+    """Get engagement counts. We first try the HTML page (most reliable —
+    LinkedIn's own frontend reads from it). Voyager API is kept as a probe
+    in case the page-embedded state ever stops including counts.
+    """
+    # Primary: HTML page parse
+    _, engagement, _ = await fetch_post_page(li_at, jsessionid, post_id)
+    if engagement:
+        return engagement
 
+    # Fallback: Voyager updateV2 (may 404 on modern LinkedIn but cheap to try)
     async with httpx.AsyncClient() as client:
         for urn in _urn_candidates(post_id):
             encoded = quote(urn, safe="")
             url = f"https://www.linkedin.com/voyager/api/feed/updateV2/{encoded}"
             try:
                 resp = await _voyager_get(client, url, li_at, jsessionid)
-            except Exception as e:
-                logger.error(f"Voyager engagement transport error for {urn}: {e}")
+            except Exception:
                 continue
-
             if resp.status_code in (401, 403):
-                logger.warning(
-                    f"Voyager auth failed ({resp.status_code}) for {urn} — cookies need refresh"
-                )
                 return {"_auth_error": True}
-
             if resp.status_code == 200:
                 try:
                     parsed = _parse_counts(resp.json())
-                except Exception as e:
-                    logger.error(f"Voyager parse error for {urn}: {e}")
-                    return None
-                if parsed is not None:
-                    logger.info(f"Voyager hit on {urn}: {parsed}")
+                except Exception:
+                    continue
+                if parsed:
                     return parsed
-                logger.warning(f"Voyager 200 but no counts found in {urn}")
-                continue
-
-            last_status = resp.status_code
-            last_body = resp.text[:200]
-
-    logger.warning(
-        f"Voyager engagement: all URN candidates failed for {post_id}. "
-        f"Last status {last_status}: {last_body}"
-    )
     return None
 
 

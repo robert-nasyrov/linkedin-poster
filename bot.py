@@ -135,7 +135,6 @@ async def cmd_relink_li(message: Message):
 
     # Quick verification: try fetching engagement on the latest posted post
     from database import get_posted_posts_for_stats
-    from linkedin_voyager import fetch_engagement
     posts = await get_posted_posts_for_stats(pool)
     li_posts = [p for p in posts if p.get("linkedin_post_id")]
 
@@ -144,41 +143,34 @@ async def cmd_relink_li(message: Message):
         return
 
     test_post = li_posts[0]
-    activity_urn = test_post.get("linkedin_activity_urn")
-    if not activity_urn:
-        from linkedin_voyager import resolve_activity_urn
-        from database import set_linkedin_activity_urn
-        activity_urn = await resolve_activity_urn(
-            li_at, jsessionid, test_post["linkedin_post_id"]
-        )
-        if activity_urn:
-            await set_linkedin_activity_urn(pool, test_post["id"], activity_urn)
+    from linkedin_voyager import fetch_post_page
+    from database import set_linkedin_activity_urn
 
-    if not activity_urn:
-        await message.answer(
-            "⚠️ Cookies saved but couldn't resolve the activity URN for the test post. "
-            "The post might be deleted or the cookies don't have feed access. "
-            "Check Railway logs."
-        )
-        return
+    activity_urn, stats, _ = await fetch_post_page(
+        li_at, jsessionid, test_post["linkedin_post_id"]
+    )
 
-    stats = await fetch_engagement(li_at, jsessionid, f"urn:li:activity:{activity_urn}")
-    if stats and not stats.get("_auth_error"):
-        await message.answer(
-            f"✅ Cookies saved and verified.\n"
-            f"Test post (activity {activity_urn}): "
-            f"{stats['likes']}❤️ {stats['comments']}💬 {stats['shares']}🔄\n"
-            f"Run /stats to collect for all posts."
-        )
-    elif stats and stats.get("_auth_error"):
+    if isinstance(stats, dict) and stats.get("_auth_error"):
         await message.answer(
             "⚠️ Cookies saved but LinkedIn rejected them (401/403). "
             "Make sure you copied the exact values from a fresh logged-in session."
         )
+        return
+
+    if activity_urn:
+        await set_linkedin_activity_urn(pool, test_post["id"], activity_urn)
+
+    if stats:
+        await message.answer(
+            f"✅ Cookies saved and verified.\n"
+            f"Test post (activity {activity_urn or '?'}): "
+            f"{stats['likes']}❤️ {stats['comments']}💬 {stats['shares']}🔄 {stats['views']}👁\n"
+            f"Run /stats to collect for all posts."
+        )
     else:
         await message.answer(
-            "⚠️ Cookies saved but the test request failed. "
-            "Check Railway logs for the exact error and re-paste if needed."
+            "⚠️ Cookies saved but couldn't parse engagement from the post page. "
+            "Check Railway logs for the diagnostic dump."
         )
 
 

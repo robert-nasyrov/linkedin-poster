@@ -154,42 +154,39 @@ async def _collect_linkedin_via_voyager(pool, post, li_at, jsessionid) -> tuple[
     Returns (collected, auth_error). auth_error=True means cookies are stale —
     caller should stop calling Voyager and notify the user.
 
-    LinkedIn's share/ugcPost numeric IDs do NOT equal activity URN IDs.
-    On first call for a post we resolve the activity URN via redirect
-    crawl and cache it on linkedin_posts so subsequent calls are 1 request.
+    Single fetch of the post page gives us both the activity URN AND counts —
+    LinkedIn's frontend reads them from the same embedded JSON, so we can too.
     """
     from database import save_post_stats, save_post_comment, set_linkedin_activity_urn
-    from linkedin_voyager import (
-        fetch_engagement, fetch_comments, resolve_activity_urn, jitter,
+    from linkedin_voyager import fetch_post_page, fetch_comments, jitter
+
+    activity_urn, stats, _ = await fetch_post_page(
+        li_at, jsessionid, post["linkedin_post_id"]
     )
 
-    activity_urn = post.get("linkedin_activity_urn")
-    if not activity_urn:
-        resolved = await resolve_activity_urn(li_at, jsessionid, post["linkedin_post_id"])
-        if resolved:
-            activity_urn = resolved
-            await set_linkedin_activity_urn(pool, post["id"], activity_urn)
-            logger.info(f"Resolved activity URN {activity_urn} for post #{post['id']}")
-        else:
-            logger.warning(f"Could not resolve activity URN for post #{post['id']}")
-            return (False, False)
-
-    target = f"urn:li:activity:{activity_urn}"
-    stats = await fetch_engagement(li_at, jsessionid, target)
-    if stats and stats.get("_auth_error"):
+    if isinstance(stats, dict) and stats.get("_auth_error"):
         return (False, True)
+
+    if activity_urn and not post.get("linkedin_activity_urn"):
+        await set_linkedin_activity_urn(pool, post["id"], activity_urn)
+        logger.info(f"Resolved activity URN {activity_urn} for post #{post['id']}")
+
     if not stats:
+        logger.warning(f"No engagement parsed for post #{post['id']} (LI {post['linkedin_post_id']})")
         return (False, False)
 
     await save_post_stats(
         pool, post["id"], "linkedin", post["linkedin_post_id"],
         stats["likes"], stats["comments"], stats["shares"], stats["views"]
     )
-    if stats["comments"] > 0:
+
+    if stats["comments"] > 0 and activity_urn:
+        target = f"urn:li:activity:{activity_urn}"
         for c in await fetch_comments(li_at, jsessionid, target):
             await save_post_comment(
                 pool, post["id"], "linkedin", c["id"], c["author"], c["text"]
             )
+
     await jitter()
     return (True, False)
 
