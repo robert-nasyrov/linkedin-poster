@@ -148,32 +148,6 @@ async def cmd_status(message: Message):
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    """Show top performing posts."""
-    if message.from_user.id != TELEGRAM_ADMIN_ID:
-        return
-    
-    from database import get_top_posts
-    top = await get_top_posts(pool, limit=5)
-    
-    if not top:
-        await message.answer("📊 No stats yet. Posts will be tracked after publishing. Stats collected daily at 21:00.")
-        return
-    
-    lines = ["📊 Top Performing Posts:\n"]
-    for i, t in enumerate(top):
-        platform = t.get("platform", "?")
-        likes = t.get("likes", 0)
-        comments = t.get("comments", 0)
-        shares = t.get("shares", 0)
-        views = t.get("views", 0)
-        text = t.get("post_text", "")[:100]
-        lines.append(f"{i+1}. [{platform}] {likes}❤️ {comments}💬 {shares}🔄 {views}👁\n   {text}...")
-    
-    await message.answer("\n".join(lines))
-
-
 @router.message(Command("fetch"))
 async def cmd_fetch(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
