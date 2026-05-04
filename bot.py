@@ -832,6 +832,10 @@ async def send_approval(chat_id: int, post_id: int, generated: dict):
             InlineKeyboardButton(text="✏️ Edit", callback_data=f"edit:{post_id}"),
         ],
         [
+            InlineKeyboardButton(text="🖼 Reroll image", callback_data=f"rerollimg:{post_id}"),
+            InlineKeyboardButton(text="📷 Upload photo", callback_data=f"uploadimg:{post_id}"),
+        ],
+        [
             InlineKeyboardButton(text="❌ Reject", callback_data=f"reject:{post_id}"),
         ],
     ])
@@ -1135,9 +1139,85 @@ async def cb_reject(callback: CallbackQuery):
 # State tracking
 edit_states = {}
 reject_states = {}
+photo_upload_states = {}  # user_id -> post_id awaiting a photo
+
+
+@router.callback_query(F.data.startswith("rerollimg:"))
+async def cb_reroll_image(callback: CallbackQuery):
+    """Regenerate the AI image (meme or Unsplash photo) for an existing draft."""
+    post_id = int(callback.data.split(":")[1])
+    await callback.answer("🖼 Generating new image...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    post_data = await get_post(pool, post_id)
+    if not post_data:
+        await callback.message.reply("Post not found")
+        return
+
+    import httpx
+    from post_generator import generate_visual
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            new_meme = await generate_visual(client, post_data["post_text"])
+    except Exception as e:
+        logger.error(f"Reroll image error: {e}")
+        await callback.message.reply(f"❌ Couldn't generate new image: {e}")
+        return
+
+    await update_post_text(pool, post_id, post_data["post_text"], new_meme)
+    generated = {"post_text": post_data["post_text"], "meme": new_meme}
+    await callback.message.reply("🖼 New image:")
+    await send_approval(callback.message.chat.id, post_id, generated)
+
+
+@router.callback_query(F.data.startswith("uploadimg:"))
+async def cb_upload_image(callback: CallbackQuery):
+    """Ask user to send a photo as the new image for a draft."""
+    post_id = int(callback.data.split(":")[1])
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(
+        f"📷 Send a photo to attach to post #{post_id}.\n"
+        f"(Caption ignored — only the photo will be used. Send /skip to cancel.)"
+    )
+    photo_upload_states[callback.from_user.id] = post_id
+
+
+@router.message(F.photo)
+async def handle_uploaded_photo(message: Message):
+    """Catch a photo only when we're waiting for one for a specific post.
+    /post <text> with attached photo is handled by cmd_post via Command filter."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    # /post is the existing publish-direct flow — let cmd_post own it
+    if message.caption and message.caption.strip().startswith("/"):
+        return
+    if message.from_user.id not in photo_upload_states:
+        return
+
+    post_id = photo_upload_states.pop(message.from_user.id)
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file.file_path}"
+    new_meme = {"source": "telegram_photo", "image_url": file_url}
+
+    post_data = await get_post(pool, post_id)
+    if not post_data:
+        await message.answer("Post not found")
+        return
+
+    await update_post_text(pool, post_id, post_data["post_text"], new_meme)
+    generated = {"post_text": post_data["post_text"], "meme": new_meme}
+    await message.answer("📷 Photo attached.")
+    await send_approval(message.chat.id, post_id, generated)
+
 
 @router.message(Command("skip"))
 async def cmd_skip(message: Message):
+    if message.from_user.id in photo_upload_states:
+        photo_upload_states.pop(message.from_user.id)
+        await message.answer("⏭ Photo upload cancelled.")
+        return
     if message.from_user.id in reject_states:
         reject_states.pop(message.from_user.id)
         await message.answer("⏭ Skipped. No feedback saved.")
