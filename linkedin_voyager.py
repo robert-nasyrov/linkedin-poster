@@ -36,18 +36,23 @@ _BROWSER_UA = (
 )
 
 
-def _activity_urn(post_id: str) -> str:
-    """Map our stored post id (raw number or share URN) to an activity URN."""
+def _numeric_id(post_id: str) -> str:
+    """Extract bare numeric id from any URN form ('urn:li:share:NNN' → 'NNN')."""
     sid = (post_id or "").strip()
-    if sid.startswith("urn:li:activity:"):
-        return sid
-    if sid.startswith("urn:li:share:"):
-        sid = sid[len("urn:li:share:"):]
-    elif sid.startswith("urn:li:ugcPost:"):
-        sid = sid[len("urn:li:ugcPost:"):]
-    elif ":" in sid:
+    if ":" in sid:
         sid = sid.rsplit(":", 1)[-1]
-    return f"urn:li:activity:{sid}"
+    return sid
+
+
+def _urn_candidates(post_id: str) -> list[str]:
+    """A post's numeric id can resolve under multiple URN namespaces.
+    Try them in order — Voyager will 404 on the wrong one, 200 on the right."""
+    nid = _numeric_id(post_id)
+    return [
+        f"urn:li:activity:{nid}",
+        f"urn:li:share:{nid}",
+        f"urn:li:ugcPost:{nid}",
+    ]
 
 
 def _build_headers(jsessionid: str) -> dict:
@@ -87,62 +92,101 @@ async def _voyager_get(client: httpx.AsyncClient, url: str,
     )
 
 
-async def fetch_engagement(li_at: str, jsessionid: str, post_id: str) -> dict | None:
-    """Return dict with likes/comments/shares/views from Voyager updateV2.
-    Returns None on any error (auth, network, parsing)."""
-    urn = _activity_urn(post_id)
-    encoded = quote(urn, safe="")
-    url = f"https://www.linkedin.com/voyager/api/feed/updateV2/{encoded}"
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await _voyager_get(client, url, li_at, jsessionid)
-            if resp.status_code in (401, 403):
-                logger.warning(f"Voyager auth failed ({resp.status_code}) for {urn} — cookies need refresh")
-                return {"_auth_error": True}
-            if resp.status_code != 200:
-                logger.warning(f"Voyager engagement {resp.status_code} for {urn}: {resp.text[:200]}")
-                return None
-
-            data = resp.json()
-            counts = (
-                data.get("socialDetail", {}).get("totalSocialActivityCounts", {})
-                or {}
-            )
+def _parse_counts(data: dict) -> dict | None:
+    """Pull engagement counts out of Voyager's normalized response shape.
+    Returns None if no counts could be located."""
+    # Direct: socialDetail at top level
+    sd = data.get("socialDetail")
+    if isinstance(sd, dict):
+        counts = sd.get("totalSocialActivityCounts") or {}
+        if counts:
             return {
                 "likes": int(counts.get("numLikes", 0) or 0),
                 "comments": int(counts.get("numComments", 0) or 0),
                 "shares": int(counts.get("numShares", 0) or 0),
-                # Views require a separate analytics endpoint that's only available
-                # to authors. Punt on v1 — engagement signal is the load-bearing part.
                 "views": int(counts.get("numImpressions", 0) or 0),
             }
-    except Exception as e:
-        logger.error(f"Voyager engagement error for {post_id}: {e}")
-        return None
+
+    # Normalized: counts may live in `included` array under the right $type
+    for el in data.get("included", []) or []:
+        t = el.get("$type", "") or ""
+        if "SocialActivityCounts" in t:
+            return {
+                "likes": int(el.get("numLikes", 0) or 0),
+                "comments": int(el.get("numComments", 0) or 0),
+                "shares": int(el.get("numShares", 0) or 0),
+                "views": int(el.get("numImpressions", 0) or 0),
+            }
+
+    return None
+
+
+async def fetch_engagement(li_at: str, jsessionid: str, post_id: str) -> dict | None:
+    """Try each URN namespace until Voyager returns 200, then parse counts.
+    Returns {"_auth_error": True} on 401/403, None on other failures."""
+    last_status = None
+    last_body = ""
+
+    async with httpx.AsyncClient() as client:
+        for urn in _urn_candidates(post_id):
+            encoded = quote(urn, safe="")
+            url = f"https://www.linkedin.com/voyager/api/feed/updateV2/{encoded}"
+            try:
+                resp = await _voyager_get(client, url, li_at, jsessionid)
+            except Exception as e:
+                logger.error(f"Voyager engagement transport error for {urn}: {e}")
+                continue
+
+            if resp.status_code in (401, 403):
+                logger.warning(
+                    f"Voyager auth failed ({resp.status_code}) for {urn} — cookies need refresh"
+                )
+                return {"_auth_error": True}
+
+            if resp.status_code == 200:
+                try:
+                    parsed = _parse_counts(resp.json())
+                except Exception as e:
+                    logger.error(f"Voyager parse error for {urn}: {e}")
+                    return None
+                if parsed is not None:
+                    logger.info(f"Voyager hit on {urn}: {parsed}")
+                    return parsed
+                logger.warning(f"Voyager 200 but no counts found in {urn}")
+                continue
+
+            last_status = resp.status_code
+            last_body = resp.text[:200]
+
+    logger.warning(
+        f"Voyager engagement: all URN candidates failed for {post_id}. "
+        f"Last status {last_status}: {last_body}"
+    )
+    return None
 
 
 async def fetch_comments(li_at: str, jsessionid: str, post_id: str,
                          limit: int = 20) -> list[dict]:
-    """Return list of {id, author, text} from the Voyager comments endpoint.
+    """Try each URN namespace for the Voyager comments endpoint.
     Returns [] on any error."""
-    urn = _activity_urn(post_id)
-    encoded = quote(urn, safe="")
-    url = (
-        "https://www.linkedin.com/voyager/api/feed/comments"
-        f"?numComments={int(limit)}&q=updateV2&start=0&updateId={encoded}"
-    )
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await _voyager_get(client, url, li_at, jsessionid)
+    async with httpx.AsyncClient() as client:
+        for urn in _urn_candidates(post_id):
+            encoded = quote(urn, safe="")
+            url = (
+                "https://www.linkedin.com/voyager/api/feed/comments"
+                f"?numComments={int(limit)}&q=updateV2&start=0&updateId={encoded}"
+            )
+            try:
+                resp = await _voyager_get(client, url, li_at, jsessionid)
+            except Exception as e:
+                logger.error(f"Voyager comments transport error for {urn}: {e}")
+                continue
             if resp.status_code != 200:
-                logger.warning(
-                    f"Voyager comments {resp.status_code} for {urn}: {resp.text[:200]}"
-                )
-                return []
-
-            data = resp.json()
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                continue
             elements = data.get("elements") or data.get("included") or []
             out: list[dict] = []
             for el in elements:
@@ -172,9 +216,8 @@ async def fetch_comments(li_at: str, jsessionid: str, post_id: str,
                         "author": str(actor),
                         "text": text_block,
                     })
-            return out
-    except Exception as e:
-        logger.error(f"Voyager comments error for {post_id}: {e}")
+            if out:
+                return out
         return []
 
 
