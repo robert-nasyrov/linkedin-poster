@@ -94,10 +94,65 @@ async def _voyager_get(client: httpx.AsyncClient, url: str,
 
 
 _ACTIVITY_RE = re.compile(r"urn[:%]li[:%]activity[:%](\d+)")
-_NUMLIKES_RE = re.compile(r'"numLikes"\s*:\s*(\d+)')
-_NUMCOMMENTS_RE = re.compile(r'"numComments"\s*:\s*(\d+)')
-_NUMSHARES_RE = re.compile(r'"numShares"\s*:\s*(\d+)')
-_NUMVIEWS_RE = re.compile(r'"numImpressions"\s*:\s*(\d+)|"numViews"\s*:\s*(\d+)')
+
+# LinkedIn ships engagement counts under several field name conventions
+# depending on which response shape the frontend expected. Match any of them
+# (in JSON) and we'll classify by name afterwards. Allow both " and &quot;
+# so we can read counts even when the JSON was HTML-escaped inside <code>.
+_COUNT_RE = re.compile(
+    r'(?:"|&quot;)([a-zA-Z]+)(?:"|&quot;)\s*:\s*(\d+)'
+)
+
+_LIKE_KEYS = (
+    "numLikes", "reactionCount", "reactionsCount", "numReactions",
+    "likeCount", "likesCount",
+)
+_COMMENT_KEYS = (
+    "numComments", "commentCount", "commentsCount",
+)
+_SHARE_KEYS = (
+    "numShares", "shareCount", "sharesCount",
+    "numReshares", "reshareCount", "repostCount", "repostsCount",
+)
+_VIEW_KEYS = (
+    "numImpressions", "impressionCount",
+    "numViews", "viewCount", "viewsCount",
+)
+
+
+def _classify_counts(html: str) -> tuple[dict | None, dict]:
+    """Walk every numeric JSON field in the HTML, take the MAX value seen for
+    each known synonym (LinkedIn embeds the same data multiple times in its
+    initial-state blobs — feed card, post detail, analytics — and we want the
+    canonical / largest one). Returns (counts_or_none, all_seen_for_debug)."""
+    seen_max: dict[str, int] = {}
+    for name, val in _COUNT_RE.findall(html):
+        try:
+            v = int(val)
+        except ValueError:
+            continue
+        if v > seen_max.get(name, -1):
+            seen_max[name] = v
+
+    def pick(keys):
+        for k in keys:
+            if k in seen_max:
+                return seen_max[k]
+        return 0
+
+    likes = pick(_LIKE_KEYS)
+    comments = pick(_COMMENT_KEYS)
+    shares = pick(_SHARE_KEYS)
+    views = pick(_VIEW_KEYS)
+
+    if likes or comments or shares or views:
+        return ({
+            "likes": likes,
+            "comments": comments,
+            "shares": shares,
+            "views": views,
+        }, seen_max)
+    return (None, seen_max)
 
 
 def _page_headers() -> dict:
@@ -158,23 +213,27 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
                 if m:
                     activity = m.group(1)
 
-            engagement: dict | None = None
-            likes_m = _NUMLIKES_RE.search(html)
-            comments_m = _NUMCOMMENTS_RE.search(html)
-            shares_m = _NUMSHARES_RE.search(html)
-            views_m = _NUMVIEWS_RE.search(html)
-            if likes_m or comments_m or shares_m:
-                v = views_m.group(1) or views_m.group(2) if views_m else 0
-                engagement = {
-                    "likes": int(likes_m.group(1)) if likes_m else 0,
-                    "comments": int(comments_m.group(1)) if comments_m else 0,
-                    "shares": int(shares_m.group(1)) if shares_m else 0,
-                    "views": int(v or 0),
-                }
+            engagement, seen = _classify_counts(html)
+            if engagement is None and seen:
+                # We saw count-shaped fields but none matched our synonym list —
+                # log what we DID see so we can extend _LIKE_KEYS / etc.
+                # Filter to only fields with words that hint at engagement.
+                hint = {k: v for k, v in seen.items()
+                        if any(t in k.lower() for t in
+                               ("like", "comment", "share", "react", "view",
+                                "impress", "repost", "reshare"))}
+                if hint:
+                    logger.info(f"Engagement-shaped fields in page (unmatched): {hint}")
+                else:
+                    logger.info(
+                        f"No engagement-like fields found. Top numeric fields "
+                        f"seen: {dict(list(seen.items())[:15])}"
+                    )
 
             if activity or engagement:
                 logger.info(
-                    f"Page hit on {prefix}:{nid} — activity={activity}, engagement={engagement}"
+                    f"Page hit on {prefix}:{nid} — activity={activity}, "
+                    f"engagement={engagement}"
                 )
                 return (activity, engagement, debug)
 
