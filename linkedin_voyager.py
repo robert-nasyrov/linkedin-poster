@@ -124,12 +124,27 @@ async def _voyager_get(client: httpx.AsyncClient, url: str,
 
 _ACTIVITY_RE = re.compile(r"urn[:%]li[:%]activity[:%](\d+)")
 
-# LinkedIn ships engagement counts under several field name conventions
-# depending on which response shape the frontend expected. Match any of them
-# (in JSON) and we'll classify by name afterwards. Allow both " and &quot;
-# so we can read counts even when the JSON was HTML-escaped inside <code>.
+# Strategy 1: JSON field names (works on analytics, sometimes on detail)
 _COUNT_RE = re.compile(
     r'(?:"|&quot;)([a-zA-Z]+)(?:"|&quot;)\s*:\s*(\d+)'
+)
+
+# Strategy 2: aria-label phrases LinkedIn renders for accessibility — these
+# almost always contain plain numbers in human-readable form, e.g.
+#   aria-label="25 reactions"
+#   aria-label="14 comments"
+#   aria-label="2 reposts"
+_ARIA_RE = re.compile(
+    r'aria-label\s*=\s*"(\d+(?:[.,]\d+)?)\s+'
+    r'(reactions?|likes?|comments?|reposts?|reshares?|views?|impressions?)\b',
+    re.IGNORECASE,
+)
+
+# Strategy 3: visible text in the post UI — e.g. "25 reactions • 14 comments"
+_TEXT_RE = re.compile(
+    r'>\s*(\d+(?:[.,]\d+)?)\s*'
+    r'(reactions?|likes?|comments?|reposts?|reshares?|views?|impressions?)\b',
+    re.IGNORECASE,
 )
 
 _LIKE_KEYS = (
@@ -149,39 +164,71 @@ _VIEW_KEYS = (
 )
 
 
+def _to_int(s: str) -> int:
+    """Parse '1,234' / '1.234' / '1500' → int. LinkedIn sometimes thousand-separates."""
+    return int(s.replace(",", "").replace(".", "")) if s else 0
+
+
 def _classify_counts(html: str) -> tuple[dict | None, dict]:
-    """Walk every numeric JSON field in the HTML, take the MAX value seen for
-    each known synonym (LinkedIn embeds the same data multiple times in its
-    initial-state blobs — feed card, post detail, analytics — and we want the
-    canonical / largest one). Returns (counts_or_none, all_seen_for_debug)."""
-    seen_max: dict[str, int] = {}
+    """Try multiple parsing strategies. Returns (counts_or_none, all_seen_for_debug)."""
+    seen: dict[str, int] = {}
+
+    # Strategy 1: JSON
     for name, val in _COUNT_RE.findall(html):
         try:
             v = int(val)
         except ValueError:
             continue
-        if v > seen_max.get(name, -1):
-            seen_max[name] = v
+        if v > seen.get(name, -1):
+            seen[name] = v
 
-    def pick(keys):
+    # Strategy 2: aria-label (most reliable on rendered pages)
+    aria_buckets: dict[str, int] = {}
+    for num, kind in _ARIA_RE.findall(html):
+        kind_l = kind.lower().rstrip("s")  # singular
+        bucket = {
+            "reaction": "likes", "like": "likes",
+            "comment": "comments",
+            "repost": "shares", "reshare": "shares",
+            "view": "views", "impression": "views",
+        }.get(kind_l)
+        if bucket:
+            v = _to_int(num)
+            if v > aria_buckets.get(bucket, -1):
+                aria_buckets[bucket] = v
+            seen[f"aria.{kind_l}"] = max(seen.get(f"aria.{kind_l}", -1), v)
+
+    # Strategy 3: visible text fallback
+    text_buckets: dict[str, int] = {}
+    for num, kind in _TEXT_RE.findall(html):
+        kind_l = kind.lower().rstrip("s")
+        bucket = {
+            "reaction": "likes", "like": "likes",
+            "comment": "comments",
+            "repost": "shares", "reshare": "shares",
+            "view": "views", "impression": "views",
+        }.get(kind_l)
+        if bucket:
+            v = _to_int(num)
+            if v > text_buckets.get(bucket, -1):
+                text_buckets[bucket] = v
+            seen[f"text.{kind_l}"] = max(seen.get(f"text.{kind_l}", -1), v)
+
+    # Pick by priority: JSON keys → aria → visible text
+    def pick_json(keys):
         for k in keys:
-            if k in seen_max:
-                return seen_max[k]
+            if k in seen and not k.startswith(("aria.", "text.")):
+                return seen[k]
         return 0
 
-    likes = pick(_LIKE_KEYS)
-    comments = pick(_COMMENT_KEYS)
-    shares = pick(_SHARE_KEYS)
-    views = pick(_VIEW_KEYS)
+    likes = pick_json(_LIKE_KEYS) or aria_buckets.get("likes") or text_buckets.get("likes") or 0
+    comments = pick_json(_COMMENT_KEYS) or aria_buckets.get("comments") or text_buckets.get("comments") or 0
+    shares = pick_json(_SHARE_KEYS) or aria_buckets.get("shares") or text_buckets.get("shares") or 0
+    views = pick_json(_VIEW_KEYS) or aria_buckets.get("views") or text_buckets.get("views") or 0
 
     if likes or comments or shares or views:
-        return ({
-            "likes": likes,
-            "comments": comments,
-            "shares": shares,
-            "views": views,
-        }, seen_max)
-    return (None, seen_max)
+        return ({"likes": likes, "comments": comments, "shares": shares, "views": views}, seen)
+    return (None, seen)
 
 
 def _page_headers() -> dict:
@@ -227,7 +274,8 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str,
     activity: str | None = None
 
     async with httpx.AsyncClient() as client:
-        # Step 1: resolve activity URN from public post page
+        post_html: str | None = None
+        # Step 1: resolve activity URN from public post page (and capture HTML)
         for prefix in ("urn:li:share", "urn:li:ugcPost", "urn:li:activity"):
             url = f"https://www.linkedin.com/feed/update/{prefix}:{nid}/"
             resp = await _fetch_html(client, url, li_at, jsessionid, raw_cookies)
@@ -253,11 +301,48 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str,
                     activity = m.group(1)
 
             if activity:
+                post_html = resp.text
                 break
 
         if not activity:
             logger.warning(f"Couldn't resolve activity URN for share_id={share_id}")
             return (None, None, debug)
+
+        # Step 1b: try parsing engagement directly from the post detail page —
+        # it's renderable for the user and contains aria-labels with counts.
+        if post_html:
+            engagement, seen = _classify_counts(post_html)
+            if engagement:
+                logger.info(
+                    f"Counts found on post detail page (no analytics needed) "
+                    f"for activity:{activity}: {engagement}"
+                )
+                return (activity, engagement, debug)
+            elif seen:
+                hint = {k: v for k, v in seen.items()
+                        if k.startswith(("aria.", "text."))
+                        or any(t in k.lower() for t in
+                               ("like", "comment", "share", "react", "view",
+                                "impress", "repost"))}
+                if hint:
+                    logger.info(f"Post detail engagement-shaped fields: {hint}")
+                else:
+                    # No engagement keywords at all — likely SPA shell.
+                    # Dump 200-char window around any of these keywords, even if no number nearby
+                    snippets = {}
+                    lower = post_html.lower()
+                    for kw in ("reactions", "reactioncount", "comments",
+                               "commentcount", "reposts", "shares",
+                               "aria-label", "social"):
+                        idx = lower.find(kw)
+                        if idx >= 0:
+                            snippets[kw] = post_html[max(0, idx-30):idx+200]
+                    if snippets:
+                        logger.info("Post detail keyword snippets:")
+                        for k, v in snippets.items():
+                            logger.info(f"  [{k}] {v!r}")
+                    else:
+                        logger.info(f"Post detail page has no engagement words. len={len(post_html)}")
 
         # Step 2: pull counts from the author-only analytics page
         analytics_url = (
