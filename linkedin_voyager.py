@@ -249,21 +249,41 @@ async def fetch_post_page(li_at: str, jsessionid: str, share_id: str
             return (activity, None, debug)
 
         html = resp.text
+
+        # Detect the "redirected to login" stub even though status was 200
+        if "/uas/login" in str(resp.url) or "/checkpoint/" in str(resp.url):
+            logger.warning(
+                f"Analytics redirected to login (final={resp.url}) — "
+                f"cookies don't have analytics access"
+            )
+            return (activity, None, debug)
+
         engagement, seen = _classify_counts(html)
-        if engagement is None and seen:
-            # Diagnostic: surface what fields we DID see if synonyms didn't match
-            hint = {k: v for k, v in seen.items()
-                    if any(t in k.lower() for t in
-                           ("like", "comment", "share", "react", "view",
-                            "impress", "repost", "reshare"))}
-            if hint:
-                logger.info(f"Analytics fields (unmatched synonyms): {hint}")
+
+        if engagement is None:
+            # Dump 200-char snippets around engagement keywords so we can see
+            # what format the numbers actually live in (the page is an SPA
+            # and may render counts in a non-JSON form).
+            snippets = {}
+            lower = html.lower()
+            for kw in ("impressionscount", "reactionscount", "commentscount",
+                       "numimpressions", "numreactions", "numcomments",
+                       "totalsocialactivitycounts", "viewscount", "likescount",
+                       "reposts", "shares"):
+                idx = lower.find(kw)
+                if idx >= 0:
+                    snippets[kw] = html[max(0, idx-30):idx+200]
+            if snippets:
+                logger.info(f"Analytics keyword snippets for activity:{activity}:")
+                for k, v in snippets.items():
+                    logger.info(f"  [{k}] {v!r}")
+            elif seen:
+                logger.info(f"Analytics has numeric fields but no engagement match. "
+                            f"Sample: {dict(list(seen.items())[:20])}")
             else:
-                top = dict(list(seen.items())[:30])
-                logger.info(
-                    f"Analytics page len={len(html)}, no engagement words. "
-                    f"Sample keys: {top}"
-                )
+                # No keywords found at all — likely SPA shell, data via XHR
+                logger.info(f"Analytics has no engagement keywords in HTML. "
+                            f"len={len(html)}. First 400 chars: {html[:400]!r}")
 
         logger.info(
             f"Analytics hit for activity:{activity} — engagement={engagement}, "
