@@ -9,8 +9,10 @@ LinkedIn Auto-Poster Bot
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
+import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -209,8 +211,7 @@ async def cmd_limport(message: Message):
 
     # The sheet has TWO subtables side by side: cols A-C are by Engagements,
     # cols E-G are by Impressions. Same posts appear in both, indexed by URL.
-    import re as _re
-    urn_re = _re.compile(r"share-(\d+)-")
+    urn_re = re.compile(r"share-(\d+)-")
 
     by_urn: dict[str, dict] = {}  # numeric_share_id → {url, date, engagements, impressions}
 
