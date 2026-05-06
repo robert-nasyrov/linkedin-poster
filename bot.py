@@ -95,6 +95,250 @@ async def cmd_start(message: Message):
     )
 
 
+async def _claude_vision(image_url: str, prompt: str, max_tokens: int = 600) -> str:
+    """Download a Telegram-hosted image, send to Claude Vision, return raw text."""
+    from base64 import b64encode
+    from config import ANTHROPIC_API_KEY
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        img = await client.get(image_url)
+        img.raise_for_status()
+        data_b64 = b64encode(img.content).decode()
+
+    media_type = "image/jpeg"  # Telegram serves JPEGs; Claude accepts via this MIME
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": max_tokens,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": data_b64},
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"].strip()
+
+
+def _strip_codefence(s: str) -> str:
+    return s.replace("```json", "").replace("```", "").strip()
+
+
+def _to_int_loose(x) -> int:
+    """Parse '1.2K' / '1,200' / 1500 / '5' → int."""
+    if isinstance(x, (int, float)):
+        return int(x)
+    if not x:
+        return 0
+    s = str(x).strip().upper().replace(",", "").replace(" ", "")
+    if s.endswith("K"):
+        try:
+            return int(float(s[:-1]) * 1000)
+        except ValueError:
+            return 0
+    if s.endswith("M"):
+        try:
+            return int(float(s[:-1]) * 1_000_000)
+        except ValueError:
+            return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+@router.message(F.photo & F.caption.regexp(r"^/lpic(\s|$)"))
+async def cmd_lpic(message: Message):
+    """Update LinkedIn engagement for one post from a screenshot of its analytics."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    parts = (message.caption or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(
+            "Usage: send a screenshot of the post's LinkedIn analytics page "
+            "with caption: /lpic <post_id>\n"
+            "Run /lstats to see the list of post IDs."
+        )
+        return
+
+    post_id = int(parts[1])
+    post_data = await get_post(pool, post_id)
+    if not post_data or not post_data.get("linkedin_post_id"):
+        await message.answer(f"Post #{post_id} not found or wasn't on LinkedIn.")
+        return
+
+    await message.answer("📸 Reading numbers from screenshot...")
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file.file_path}"
+
+    prompt = (
+        "This image is a LinkedIn post analytics screenshot. Extract the engagement "
+        "numbers and return ONLY a JSON object:\n"
+        '{"likes": N, "comments": N, "shares": N, "views": N}\n\n'
+        "- likes = total reactions (sum across reaction types if shown)\n"
+        "- comments = comments count\n"
+        "- shares = reposts (or shares)\n"
+        "- views = impressions (or views)\n"
+        "- Convert '1.2K' to 1200, '1,500' to 1500\n"
+        "- If a value isn't visible, use 0\n"
+        "Return ONLY valid JSON, no markdown, no explanation."
+    )
+
+    try:
+        raw = await _claude_vision(file_url, prompt, max_tokens=200)
+        cleaned = _strip_codefence(raw)
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        parsed = json.loads(cleaned[start:end])
+    except Exception as e:
+        logger.error(f"/lpic vision parse error: {e}")
+        await message.answer(f"❌ Couldn't parse screenshot: {e}")
+        return
+
+    likes = _to_int_loose(parsed.get("likes"))
+    comments = _to_int_loose(parsed.get("comments"))
+    shares = _to_int_loose(parsed.get("shares"))
+    views = _to_int_loose(parsed.get("views"))
+
+    from database import save_post_stats
+    await save_post_stats(
+        pool, post_id, "linkedin", post_data["linkedin_post_id"],
+        likes, comments, shares, views,
+    )
+    await message.answer(
+        f"✅ Post #{post_id}: {likes}❤️ {comments}💬 {shares}🔄 {views}👁\n"
+        f"Will feed the next /generate via build_learning_context."
+    )
+
+
+@router.message(F.photo & F.caption.regexp(r"^/lbulk(\s|$)"))
+async def cmd_lbulk(message: Message):
+    """Bulk-import LI engagement from a dashboard screenshot listing many posts.
+    Fuzzy-matches each visible row to a DB post by posted date + post-text snippet."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    await message.answer("📸 Parsing dashboard rows (this can take 10-15s)...")
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file.file_path}"
+
+    prompt = (
+        "This image is a LinkedIn analytics dashboard or post list with multiple posts visible. "
+        "For EACH post visible, extract:\n"
+        "- date (YYYY-MM-DD format if shown; if relative like '2 weeks ago' compute from today, "
+        "today is 2026-05-06)\n"
+        "- snippet: first 60 characters of the post text\n"
+        "- likes, comments, shares, views (integers)\n\n"
+        "Return ONLY a JSON array, one object per post:\n"
+        '[{"date": "2026-04-26", "snippet": "first 60 chars...", "likes": 5, '
+        '"comments": 2, "shares": 0, "views": 800}, ...]\n\n'
+        "Convert '1.2K' to 1200, '1,500' to 1500. Use 0 if missing. "
+        "Return ONLY valid JSON array, no markdown."
+    )
+
+    try:
+        raw = await _claude_vision(file_url, prompt, max_tokens=2500)
+        cleaned = _strip_codefence(raw)
+        start = cleaned.find("[")
+        end = cleaned.rfind("]") + 1
+        rows = json.loads(cleaned[start:end])
+    except Exception as e:
+        logger.error(f"/lbulk vision parse error: {e}")
+        await message.answer(f"❌ Couldn't parse dashboard: {e}")
+        return
+
+    if not rows:
+        await message.answer("No posts detected in screenshot.")
+        return
+
+    async with pool.acquire() as conn:
+        all_li_posts = await conn.fetch(
+            """SELECT id, post_text, posted_at, linkedin_post_id
+               FROM linkedin_posts
+               WHERE status='posted' AND linkedin_post_id IS NOT NULL
+               ORDER BY posted_at DESC"""
+        )
+
+    matched_count = 0
+    matched_ids: set[int] = set()
+    unmatched_snippets: list[str] = []
+    summary_lines: list[str] = []
+
+    for row in rows:
+        snippet = (row.get("snippet") or "").strip().lower()
+        date_str = (row.get("date") or "").strip()
+
+        candidates = [
+            p for p in all_li_posts
+            if p["id"] not in matched_ids
+            and p["posted_at"]
+            and (not date_str or p["posted_at"].date().isoformat() == date_str)
+        ]
+        match = None
+        if candidates and snippet:
+            snip_short = snippet[:25]
+            for p in candidates:
+                text = (p["post_text"] or "").lower()
+                if snip_short and snip_short in text[:200]:
+                    match = p
+                    break
+        if not match and len(candidates) == 1:
+            match = candidates[0]
+        if not match and not date_str and snippet:
+            snip_short = snippet[:25]
+            for p in all_li_posts:
+                if p["id"] in matched_ids:
+                    continue
+                text = (p["post_text"] or "").lower()
+                if snip_short and snip_short in text[:200]:
+                    match = p
+                    break
+
+        if match:
+            from database import save_post_stats
+            likes = _to_int_loose(row.get("likes"))
+            comments = _to_int_loose(row.get("comments"))
+            shares = _to_int_loose(row.get("shares"))
+            views = _to_int_loose(row.get("views"))
+            await save_post_stats(
+                pool, match["id"], "linkedin", match["linkedin_post_id"],
+                likes, comments, shares, views,
+            )
+            matched_ids.add(match["id"])
+            matched_count += 1
+            summary_lines.append(
+                f"✅ #{match['id']} ({match['posted_at'].date()}): "
+                f"{likes}❤️ {comments}💬 {shares}🔄 {views}👁"
+            )
+        else:
+            unmatched_snippets.append((row.get("snippet") or "?")[:40])
+
+    out = [f"Imported {matched_count}/{len(rows)} rows from screenshot.\n"]
+    out.extend(summary_lines[:15])
+    if unmatched_snippets:
+        out.append("\n⚠️ Couldn't match (date/text not found in DB):")
+        out.extend(f"  • {s}" for s in unmatched_snippets[:5])
+    await message.answer("\n".join(out))
+
+
 @router.message(Command("relink_li"))
 async def cmd_relink_li(message: Message):
     """Save fresh LinkedIn cookies. Best UX: paste the FULL cookie string
