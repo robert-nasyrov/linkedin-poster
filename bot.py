@@ -160,6 +160,136 @@ def _to_int_loose(x) -> int:
         return 0
 
 
+@router.message(F.document & F.document.file_name.func(
+    lambda n: bool(n and n.lower().endswith(".xlsx"))
+))
+async def cmd_limport(message: Message):
+    """Import LinkedIn analytics export (XLSX). The 'Top Posts' sheet contains
+    Post URLs that include share-<numeric_id>-<slug>; we match those numeric
+    IDs to linkedin_posts.linkedin_post_id and save engagement+impressions.
+
+    Usage: just send the .xlsx exported from LinkedIn analytics as a Telegram
+    document (no caption needed).
+    """
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    doc = message.document
+    await message.answer(f"📥 Got {doc.file_name}. Parsing...")
+
+    file = await bot.get_file(doc.file_id)
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file.file_path}"
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(file_url)
+            resp.raise_for_status()
+            xlsx_bytes = resp.content
+
+        from io import BytesIO
+        from openpyxl import load_workbook
+        wb = load_workbook(BytesIO(xlsx_bytes), read_only=True, data_only=True)
+    except Exception as e:
+        logger.error(f"/limport download/parse error: {e}")
+        await message.answer(f"❌ Couldn't read the file: {e}")
+        return
+
+    # Find the TOP POSTS sheet (LinkedIn capitalises differently across versions)
+    target_sheet = None
+    for ws in wb.worksheets:
+        if "TOP POSTS" in ws.title.upper():
+            target_sheet = ws
+            break
+    if target_sheet is None:
+        await message.answer(
+            "❌ Couldn't find a 'Top Posts' sheet. Got: "
+            + ", ".join(repr(ws.title) for ws in wb.worksheets)
+        )
+        return
+
+    # The sheet has TWO subtables side by side: cols A-C are by Engagements,
+    # cols E-G are by Impressions. Same posts appear in both, indexed by URL.
+    import re as _re
+    urn_re = _re.compile(r"share-(\d+)-")
+
+    by_urn: dict[str, dict] = {}  # numeric_share_id → {url, date, engagements, impressions}
+
+    for row in target_sheet.iter_rows(values_only=True):
+        if not row or not any(row):
+            continue
+        # Left half (A-C): URL / Date / Engagements
+        url_e, date_e, eng_val = row[0], row[1], row[2] if len(row) > 2 else None
+        # Right half (E-G): URL / Date / Impressions  (col D is the empty separator)
+        url_i = row[4] if len(row) > 4 else None
+        date_i = row[5] if len(row) > 5 else None
+        imp_val = row[6] if len(row) > 6 else None
+
+        for url, eng, imp, date in (
+            (url_e, eng_val, None, date_e),
+            (url_i, None, imp_val, date_i),
+        ):
+            if not url or not isinstance(url, str):
+                continue
+            m = urn_re.search(url)
+            if not m:
+                continue
+            urn_id = m.group(1)
+            slot = by_urn.setdefault(urn_id, {"url": url, "date": date,
+                                              "engagements": 0, "impressions": 0})
+            if eng is not None:
+                slot["engagements"] = max(slot["engagements"], _to_int_loose(eng))
+            if imp is not None:
+                slot["impressions"] = max(slot["impressions"], _to_int_loose(imp))
+
+    if not by_urn:
+        await message.answer("No post rows found in the 'Top Posts' sheet.")
+        return
+
+    # Match each parsed URN against linkedin_posts.linkedin_post_id
+    async with pool.acquire() as conn:
+        all_li = await conn.fetch(
+            """SELECT id, post_text, linkedin_post_id, posted_at
+               FROM linkedin_posts
+               WHERE linkedin_post_id IS NOT NULL"""
+        )
+    by_li_id: dict[str, dict] = {p["linkedin_post_id"]: dict(p) for p in all_li}
+
+    from database import save_post_stats
+    matched = 0
+    unmatched: list[str] = []
+    summary: list[str] = []
+
+    # Sort by impressions descending so the summary leads with biggest hits
+    for urn_id, data in sorted(by_urn.items(),
+                                key=lambda kv: -kv[1]["impressions"]):
+        post = by_li_id.get(urn_id)
+        if not post:
+            unmatched.append(urn_id[-6:])
+            continue
+
+        likes = data["engagements"]   # LinkedIn lumps reactions+comments+reposts here
+        views = data["impressions"]
+        # Comments and shares aren't broken out in the export — leave 0.
+        await save_post_stats(
+            pool, post["id"], "linkedin", post["linkedin_post_id"],
+            likes, 0, 0, views,
+        )
+        matched += 1
+        preview = (post["post_text"] or "")[:50].replace("\n", " ")
+        summary.append(f"#{post['id']}  {likes}🫶  {views}👁  {preview}...")
+
+    out = [
+        f"✅ Imported analytics for {matched}/{len(by_urn)} posts.",
+        "  ('engagements' lumped into likes column; impressions → views)",
+        "",
+    ]
+    out.extend(summary[:20])
+    if unmatched:
+        out.append(f"\n⚠️ {len(unmatched)} URNs in export had no matching DB post "
+                    f"(probably from before the bot started tracking).")
+    await message.answer("\n".join(out))
+
+
 @router.message(F.photo & F.caption.regexp(r"^/lpic(\s|$)"))
 async def cmd_lpic(message: Message):
     """Update LinkedIn engagement for one post from a screenshot of its analytics."""
