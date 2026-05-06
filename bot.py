@@ -358,6 +358,99 @@ async def cmd_lpic(message: Message):
     )
 
 
+@router.message(F.photo & F.caption.regexp(r"^/lcomments(\s|$)"))
+async def cmd_lcomments(message: Message):
+    """Save the actual COMMENT TEXT for a LinkedIn post from a screenshot of its
+    comments section. The XLSX export only gives aggregate engagement counts
+    (no text), so comment mining for intent-to-buy signals needs Vision."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    parts = (message.caption or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(
+            "Usage: send a screenshot of the comments section under your post "
+            "with caption: /lcomments <post_id>"
+        )
+        return
+
+    post_id = int(parts[1])
+    post_data = await get_post(pool, post_id)
+    if not post_data or not post_data.get("linkedin_post_id"):
+        await message.answer(f"Post #{post_id} not found or wasn't on LinkedIn.")
+        return
+
+    await message.answer("📸 Reading comments from screenshot...")
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file.file_path}"
+
+    prompt = (
+        "This image is a screenshot of comments under a LinkedIn post. "
+        "Extract every visible comment as a JSON array. For each comment:\n"
+        "- author: the commenter's display name (their public name on LinkedIn)\n"
+        "- text: the full comment text, exactly as written\n\n"
+        "Return ONLY a JSON array, one object per comment:\n"
+        '[{"author": "Jane Doe", "text": "..."}, ...]\n\n'
+        "- Do NOT include Robert Nasyrov's replies — he is the post author.\n"
+        "- Skip empty or icon-only comments.\n"
+        "- If a comment is partly cut off, include what is visible.\n"
+        "Return ONLY valid JSON, no markdown."
+    )
+
+    try:
+        raw = await _claude_vision(file_url, prompt, max_tokens=3000)
+        cleaned = _strip_codefence(raw)
+        start = cleaned.find("[")
+        end = cleaned.rfind("]") + 1
+        comments = json.loads(cleaned[start:end]) if start >= 0 else []
+    except Exception as e:
+        logger.error(f"/lcomments parse error: {e}")
+        await message.answer(f"❌ Couldn't parse comments: {e}")
+        return
+
+    if not comments:
+        await message.answer("No comments detected in screenshot.")
+        return
+
+    import hashlib
+    from database import save_post_comment
+    saved = 0
+    skipped = 0
+    for c in comments:
+        author = (c.get("author") or "unknown").strip()[:200]
+        text = (c.get("text") or "").strip()
+        if not text or len(text) < 3:
+            skipped += 1
+            continue
+        # Deterministic ID so re-uploading the same screenshot doesn't dupe rows
+        digest = hashlib.sha256(f"{author}|{text}".encode("utf-8")).hexdigest()[:24]
+        comment_id = f"li-shot:{post_id}:{digest}"
+        try:
+            await save_post_comment(
+                pool, post_id, "linkedin", comment_id, author, text
+            )
+            saved += 1
+        except Exception as e:
+            logger.warning(f"Failed to save comment: {e}")
+            skipped += 1
+
+    preview_lines = []
+    for c in comments[:5]:
+        author = (c.get("author") or "?")[:30]
+        text = (c.get("text") or "")[:80].replace("\n", " ")
+        preview_lines.append(f"  • {author}: {text}")
+
+    await message.answer(
+        f"✅ Saved {saved} comments for post #{post_id} "
+        f"({skipped} skipped as duplicates/empty).\n\n"
+        f"Sample:\n" + "\n".join(preview_lines) +
+        f"\n\nThese will surface in /generate via the "
+        f"'WHAT READERS SAID IN COMMENTS' prompt section."
+    )
+
+
 @router.message(F.photo & F.caption.regexp(r"^/lbulk(\s|$)"))
 async def cmd_lbulk(message: Message):
     """Bulk-import LI engagement from a dashboard screenshot listing many posts.
