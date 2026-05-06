@@ -115,6 +115,26 @@ async def init_db(pool):
             END $$;
         """)
 
+        # post_stats was originally INSERT-only with a pkey-on-id ON CONFLICT clause
+        # that never triggered, so every save_post_stats call appended a row. Clean
+        # up duplicates (keep the most recent per post+platform) and add a real
+        # unique constraint so future writes UPSERT cleanly.
+        await conn.execute("""
+            DELETE FROM post_stats
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM post_stats GROUP BY post_id, platform
+            );
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                ALTER TABLE post_stats
+                    ADD CONSTRAINT post_stats_post_platform_unique
+                    UNIQUE (post_id, platform);
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            WHEN others THEN NULL;
+            END $$;
+        """)
+
 
 async def save_digest(pool, channel: str, message_id: int, text: str, date: datetime):
     async with pool.acquire() as conn:
@@ -304,18 +324,23 @@ async def get_threads_token(pool):
 
 async def save_post_stats(pool, post_id: int, platform: str, platform_post_id: str,
                           likes: int = 0, comments: int = 0, shares: int = 0, views: int = 0):
+    """UPSERT one row per (post_id, platform). Older revisions of this code
+    inserted a fresh row on every call because the ON CONFLICT clause was
+    bound to the wrong constraint — that's been fixed by adding a unique
+    index on (post_id, platform) in init_db."""
     async with pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO post_stats (post_id, platform, platform_post_id, likes, comments, shares, views, updated_at)
+            """INSERT INTO post_stats
+                   (post_id, platform, platform_post_id, likes, comments, shares, views, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-               ON CONFLICT ON CONSTRAINT post_stats_pkey DO NOTHING""",
-            post_id, platform, platform_post_id, likes, comments, shares, views
-        )
-        # Update if exists
-        await conn.execute(
-            """UPDATE post_stats SET likes = $1, comments = $2, shares = $3, views = $4, updated_at = NOW()
-               WHERE post_id = $5 AND platform = $6""",
-            likes, comments, shares, views, post_id, platform
+               ON CONFLICT (post_id, platform) DO UPDATE SET
+                   platform_post_id = EXCLUDED.platform_post_id,
+                   likes = EXCLUDED.likes,
+                   comments = EXCLUDED.comments,
+                   shares = EXCLUDED.shares,
+                   views = EXCLUDED.views,
+                   updated_at = NOW()""",
+            post_id, platform, platform_post_id, likes, comments, shares, views,
         )
 
 
