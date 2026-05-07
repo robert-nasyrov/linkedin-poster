@@ -1440,6 +1440,45 @@ async def cb_skip_post(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
+async def _resend_approval(chat_id: int, post_id: int):
+    """Re-send the approval card for an existing draft. Used after publish
+    failures (token expired, image upload failed, etc) so the user doesn't
+    have to dig through chat history or recreate the draft."""
+    post_data = await get_post(pool, post_id)
+    if not post_data:
+        return
+    meme = None
+    if post_data.get("meme_suggestion"):
+        try:
+            meme = (json.loads(post_data["meme_suggestion"])
+                    if isinstance(post_data["meme_suggestion"], str)
+                    else post_data["meme_suggestion"])
+        except Exception:
+            meme = None
+    await send_approval(chat_id, post_id, {
+        "post_text": post_data["post_text"],
+        "meme": meme,
+    })
+
+
+@router.message(Command("repost"))
+async def cmd_repost(message: Message):
+    """Re-show the approval card for an existing draft (e.g., after a publish
+    failure or to re-attempt later). Usage: /repost <post_id>"""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    arg = (message.text or "").replace("/repost", "", 1).strip()
+    if not arg.isdigit():
+        await message.answer("Usage: /repost <post_id>")
+        return
+    post_id = int(arg)
+    post_data = await get_post(pool, post_id)
+    if not post_data:
+        await message.answer(f"Post #{post_id} not found.")
+        return
+    await _resend_approval(message.chat.id, post_id)
+
+
 async def send_approval(chat_id: int, post_id: int, generated: dict):
     """Send post for approval with inline buttons and meme images."""
     post_text = generated["post_text"]
@@ -1589,7 +1628,13 @@ async def cb_approve(callback: CallbackQuery):
             await callback.message.reply("✅ Posted to LinkedIn!")
     else:
         await update_post_status(pool, post_id, "draft")
-        await callback.message.reply(f"❌ LinkedIn error: {result['error']}")
+        err = str(result.get("error", ""))
+        hint = ""
+        if "EXPIRED_ACCESS_TOKEN" in err or "401" in err:
+            hint = "\n\n🔑 Looks like the LinkedIn token expired. Run /connect, then I'll re-show this draft."
+        await callback.message.reply(f"❌ LinkedIn error: {err}{hint}")
+        # Re-send approval card so the user can retry without losing the draft
+        await _resend_approval(callback.message.chat.id, post_id)
 
 
 @router.callback_query(F.data.startswith("approvetext:"))
@@ -1630,7 +1675,12 @@ async def cb_approve_text_only(callback: CallbackQuery):
             await callback.message.reply("✅ Posted to LinkedIn (text only)!")
     else:
         await update_post_status(pool, post_id, "draft")
-        await callback.message.reply(f"❌ LinkedIn error: {result['error']}")
+        err = str(result.get("error", ""))
+        hint = ""
+        if "EXPIRED_ACCESS_TOKEN" in err or "401" in err:
+            hint = "\n\n🔑 Looks like the LinkedIn token expired. Run /connect, then I'll re-show this draft."
+        await callback.message.reply(f"❌ LinkedIn error: {err}{hint}")
+        await _resend_approval(callback.message.chat.id, post_id)
 
 
 @router.callback_query(F.data.startswith("threads:"))
