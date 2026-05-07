@@ -834,6 +834,65 @@ async def cmd_write(message: Message):
         await message.answer(f"❌ Error: {e}")
 
 
+@router.message(Command("genvars"))
+async def cmd_genvars(message: Message):
+    """Generate 3 distinct variants in different energy types so Robert can
+    pick the one he actually wants to post. Each variant is locked to a
+    specific format (raw story / contrarian / behind-scenes / etc) and
+    surfaced as its own approval card."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    arg = (message.text or "").replace("/genvars", "", 1).strip()
+    await message.answer("🎲 Generating 3 variants in different formats...")
+
+    try:
+        from post_generator import generate_post_variants, build_learning_context
+        from digest_reader import get_digest_context
+
+        if arg:
+            variants = await generate_post_variants(
+                arg, pool=pool, count=3, source_kind="topic"
+            )
+        else:
+            life_context = await get_digest_context()
+            learning = await build_learning_context(pool)
+            combined = ""
+            if life_context:
+                combined += f"{life_context}\n\n"
+            if learning:
+                combined += f"{learning}\n\n"
+            if not combined.strip():
+                await message.answer(
+                    "❌ No life context yet. Run /genvars <topic> with a thought, "
+                    "or add context with /context first."
+                )
+                return
+            variants = await generate_post_variants(
+                combined, pool=pool, count=3, source_kind="digest"
+            )
+    except Exception as e:
+        logger.error(f"genvars error: {e}")
+        await message.answer(f"❌ Error: {e}")
+        return
+
+    if not variants:
+        await message.answer("❌ No variants returned.")
+        return
+
+    await message.answer(f"Got {len(variants)} variants. Pick your favorite — others auto-reject.")
+
+    for i, v in enumerate(variants, 1):
+        post_id = await save_post(pool, [], v["post_text"], v.get("meme"))
+        # Tag the energy type in the preview header so Robert sees the format intent.
+        prefixed = {
+            "post_text": f"[{v['energy']}]\n\n{v['post_text']}",
+            "meme": v.get("meme"),
+            "fact_check": v.get("fact_check"),
+        }
+        await send_approval(message.chat.id, post_id, prefixed)
+
+
 @router.message(Command("post"))
 async def cmd_post(message: Message):
     """Post text directly to LinkedIn without AI generation. Supports photo attachment."""

@@ -58,6 +58,38 @@ def load_robert_context() -> str:
 
 ROBERT_CONTEXT = load_robert_context()
 
+ENERGY_TYPES = [
+    ("RAW_STORY",
+     "RAW STORY: Something that actually happened today/this week. Messy details, "
+     "real outcome. Lead with a SCENE — what you saw, what someone said, what broke. "
+     "Then the realization. Length: 120-220 words."),
+    ("HONEST_FAIL",
+     "HONEST FAIL: Something you got wrong, what it cost, what you'd do differently. "
+     "People remember vulnerability over wins. Lead with the failure outcome, then "
+     "trace back. No false-modesty endings. Length: 100-200 words."),
+    ("CONTRARIAN",
+     "CONTRARIAN TAKE: You disagree with consensus and have lived experience to back it. "
+     "Lead with the bold counter-claim, then the proof from your actual work. End with "
+     "a sharp restatement, not a question. Length: 80-180 words."),
+    ("BEHIND_SCENES",
+     "BEHIND THE SCENES: Show the actual work. Real tools (Claude, aiogram, Railway, "
+     "Whisper, asyncpg), real errors, real logs. Lead with the technical detail, "
+     "let the lesson emerge from it. Length: 100-200 words."),
+    ("OBSERVATION",
+     "OBSERVATION: You noticed something subtle others missed. Lead with the specific "
+     "observation, name the pattern, end with one line. Length: 50-100 words."),
+    ("QUICK_THOUGHT",
+     "QUICK THOUGHT: 2-4 sentences. Single idea, sharp delivery. No setup, no "
+     "build-up. Just the thing. Length: 30-70 words."),
+    ("SCENE_DIALOGUE",
+     "SCENE WITH DIALOGUE: A real moment with someone said something memorable. "
+     "Quote them. Then the meaning to you. Length: 100-180 words."),
+    ("BEFORE_AFTER",
+     "BEFORE/AFTER: Concrete state-change in your work or life. Numbers if you have "
+     "them. Lead with the contrast, then the mechanism that caused it. Length: 80-180 words."),
+]
+
+
 SYSTEM_PROMPT = f"""You write LinkedIn posts as Robert. Not for Robert — AS him. His voice, his brain, his mess.
 
 {ROBERT_CONTEXT}
@@ -66,13 +98,25 @@ SYSTEM_PROMPT = f"""You write LinkedIn posts as Robert. Not for Robert — AS hi
 
 Forget templates. Forget "5 tips" and "here's what I learned." Write like Robert actually thinks — sometimes it's a 3-line observation, sometimes it's a 250-word story. Let the topic decide the length and shape.
 
-ENERGY TYPES (not templates — moods):
-- Raw story: Something that actually happened. Messy details. Real outcome. "My dad postponed English for 20 years. My bot fixed that in 3 days."
-- Honest fail: Something that went wrong and what it taught you. People remember vulnerability. "Spent 25 touchpoints on a client. Zero closed deals. Here's the one question I should have asked on day 1."
-- Observation: You noticed something others didn't. Short. Punchy. No fluff. Can be 3 sentences.
-- Contrarian take: You disagree with conventional wisdom and have experience to back it up. "Everyone says AI replaces jobs. I watched it create 3 new roles in my company."
-- Behind the scenes: Show the actual work. Mention real tools, real errors, real logs. "My bot generated a post about apps that don't exist. Fact-checker caught it. Here's the screenshot."
-- Quick thought: Sometimes the best post is 2-3 sentences. Don't pad it. Say the thing and stop.
+OPENING LINE — this is the one thing Robert keeps rejecting drafts for. Make the FIRST sentence one of these patterns:
+- A specific scene: "I'm reading code at 1AM when my bot pings me."
+- A blunt confession: "I spent 25 touchpoints on a client. Zero closed."
+- A counterintuitive claim: "Most automation projects fail because of the requirements doc."
+- A specific number: "2,264 candidates went through the pipeline last week."
+- A quote of someone else: "'Why can't your bot just understand?' my mom asked."
+- A direct question that's actually weird: "When did I stop reading my own code?"
+- A blunt one-line statement that opens a loop the reader has to follow.
+NEVER open with "Here's the thing", "Let me tell you", "Game-changer", "Unpopular opinion:", "I've been thinking about", or any soft preamble.
+
+ENERGY TYPES (the post should clearly inhabit ONE):
+- Raw story: real scene, real outcome
+- Honest fail: vulnerability over wins
+- Observation: subtle pattern others miss, short
+- Contrarian take: counter-claim with lived proof
+- Behind the scenes: technical detail leading to a lesson
+- Quick thought: 2-4 sentences, sharp delivery
+- Scene with dialogue: someone said something memorable
+- Before/after: concrete state-change with mechanism
 
 WHAT MAKES ROBERT'S POSTS HIT:
 - Specific > generic. "2,264 candidates processed" not "thousands of users"
@@ -84,12 +128,12 @@ WHAT MAKES ROBERT'S POSTS HIT:
 - Vary length wildly. Some posts 50 words. Some 300. Never the same twice.
 
 WHAT TO AVOID:
-- "Here's the thing" / "Let me tell you" / "Game-changer" / "Unpopular opinion:" as an opener
+- The same opening pattern as recent posts (Robert WILL notice)
 - Numbered lists as the whole post (unless it genuinely fits)
 - Fake humility ("I'm no expert but...")
 - Motivational poster energy
 - Making up numbers, tools, clients, or stories. If it's not in the context above, don't invent it.
-- Writing the same post structure twice in a row
+- Writing the same post STRUCTURE twice in a row (header → 3 examples → conclusion = banned if last post used it)
 
 === PRIVACY ===
 - Never include: revenue figures, client names (unless public), team member names, financial details
@@ -225,6 +269,22 @@ async def build_learning_context(pool) -> str:
         examples = "\n---\n".join([f"POST: {r['text'][:200]}...\nWHY REJECTED: {r['reason']}" for r in rejected[:3]])
         sections.append(f"=== POSTS ROBERT REJECTED (avoid this style/tone/topic) ===\n{examples}")
 
+    # Anti-repetition: surface the OPENING LINES of recent approved posts.
+    # Robert's strongest rejection signal is "another post that opens like the
+    # last one" — so feed Claude the literal first lines as a forbidden list.
+    if approved:
+        opens = []
+        for body in approved[:7]:
+            first_line = (body or "").strip().split("\n", 1)[0][:120]
+            if first_line:
+                opens.append(first_line)
+        if opens:
+            sections.append(
+                "=== RECENT OPENING LINES — DO NOT OPEN A NEW POST WITH ANYTHING "
+                "STRUCTURALLY SIMILAR TO ANY OF THESE ===\n"
+                + "\n".join(f"- {o}" for o in opens)
+            )
+
     # REGENERATE FEEDBACK — what Robert said when he asked to redo a draft.
     # These are stronger taste signals than rejects (he wanted the topic, just wrong execution).
     # draft_text is the EXACT text Robert was reacting to — without it the feedback is meaningless.
@@ -284,6 +344,84 @@ async def generate_post_from_digest(digest_text: str, pool=None) -> dict:
         visual = await generate_visual(client, post_text)
 
         return {"post_text": post_text, "meme": visual, "fact_check": fact_check}
+
+
+async def _generate_one_variant(client: httpx.AsyncClient, learning: str,
+                                 topic_or_digest: str, energy_label: str,
+                                 energy_hint: str, source_kind: str) -> dict | None:
+    """Generate one post locked into a specific energy type. Used by /genvars."""
+    user_msg_parts = [learning + "\n\n" if learning else ""]
+    if source_kind == "digest":
+        user_msg_parts.append(
+            f"Here's my current context — daily digests, open work items, and life situation.\n\n"
+            f"{topic_or_digest}\n\n"
+        )
+    else:
+        user_msg_parts.append(f"Write a post based on this thought:\n\n{topic_or_digest}\n\n")
+    user_msg_parts.append(
+        f"=== FORMAT LOCK FOR THIS DRAFT ===\n"
+        f"Use specifically the {energy_label} energy. Do NOT mix in other energies.\n"
+        f"{energy_hint}\n\n"
+        f"Write ONE post in that exact mode. Open with a line that fits the FORMAT LOCK, "
+        f"not the soft preambles forbidden in the system prompt."
+    )
+
+    try:
+        data = await claude_request(client, {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1000,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": "".join(user_msg_parts)}],
+        })
+        post_text = clean_post_text(data["content"][0]["text"])
+        return {"post_text": post_text, "energy": energy_label}
+    except Exception as e:
+        logger.warning(f"Variant generation failed for {energy_label}: {e}")
+        return None
+
+
+async def generate_post_variants(topic_or_digest: str, pool=None,
+                                  count: int = 3, source_kind: str = "topic") -> list[dict]:
+    """Generate `count` distinct variants in parallel, each locked to a different
+    ENERGY_TYPES entry. Returns list of {post_text, energy, meme, fact_check}.
+    """
+    learning = await build_learning_context(pool)
+    chosen = random.sample(ENERGY_TYPES, min(count, len(ENERGY_TYPES)))
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        # Phase 1: text variants in parallel
+        text_tasks = [
+            _generate_one_variant(client, learning, topic_or_digest, label, hint, source_kind)
+            for (label, hint) in chosen
+        ]
+        text_results = await asyncio.gather(*text_tasks)
+
+        # Phase 2: visuals + fact-check sequentially per variant (avoid rate-limit
+        # bursts; each variant gets its own visual that matches its tone)
+        out: list[dict] = []
+        for r in text_results:
+            if not r:
+                continue
+            await asyncio.sleep(2)
+            try:
+                visual = await generate_visual(client, r["post_text"])
+            except Exception as e:
+                logger.warning(f"visual gen failed for variant {r['energy']}: {e}")
+                visual = {"source": "none"}
+            await asyncio.sleep(2)
+            try:
+                fc = await fact_check_post(client, r["post_text"])
+            except Exception as e:
+                logger.warning(f"fact-check failed for variant {r['energy']}: {e}")
+                fc = {"status": "error", "issues": [], "suggestion": str(e)}
+            out.append({
+                "post_text": r["post_text"],
+                "energy": r["energy"],
+                "meme": visual,
+                "fact_check": fc,
+            })
+
+    return out
 
 
 async def generate_post_from_topic(topic: str, pool=None, feedback: str = None) -> dict:
