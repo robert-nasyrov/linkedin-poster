@@ -834,6 +834,86 @@ async def cmd_write(message: Message):
         await message.answer(f"❌ Error: {e}")
 
 
+@router.message(Command("talk"))
+async def cmd_talk(message: Message):
+    """Start a back-and-forth Q&A: bot asks one specific question grounded in
+    Robert's life context, he replies, bot probes for concrete details. After
+    3 exchanges (or /done) the bot drafts a post using ONLY his literal words."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    if message.from_user.id in talk_states:
+        await message.answer(
+            "🗣 Talk session already running. /done to finalize, /cancel to drop."
+        )
+        return
+
+    await message.answer("🤔 Picking a question grounded in your context...")
+    try:
+        from post_generator import generate_opener_question
+        from database import open_talk_session, append_talk_message
+        question = await generate_opener_question(pool)
+        session_id = await open_talk_session(pool)
+        await append_talk_message(pool, session_id, "bot", question)
+    except Exception as e:
+        logger.error(f"/talk opener error: {e}")
+        await message.answer(f"❌ {e}")
+        return
+
+    talk_states[message.from_user.id] = {
+        "session_id": session_id,
+        "messages": [{"role": "bot", "text": question}],
+    }
+    await message.answer(
+        f"💬 {question}\n\n"
+        f"(Reply with whatever's true. After ~3 exchanges I'll draft a post. "
+        f"/done to finalize early. /cancel to drop the session.)"
+    )
+
+
+@router.message(Command("done"))
+async def cmd_done(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    state = talk_states.get(message.from_user.id)
+    if not state:
+        await message.answer("No talk session running.")
+        return
+    user_replies = [m for m in state["messages"] if m["role"] == "user"]
+    if not user_replies:
+        from database import close_talk_session
+        await close_talk_session(pool, state["session_id"], status="abandoned")
+        talk_states.pop(message.from_user.id, None)
+        await message.answer("No replies yet. Session closed.")
+        return
+
+    await message.answer("📝 Drafting post from our conversation...")
+    try:
+        from post_generator import generate_post_from_conversation
+        from database import close_talk_session
+        generated = await generate_post_from_conversation(state["messages"], pool=pool)
+        post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
+        await close_talk_session(pool, state["session_id"], status="drafted",
+                                  post_id=post_id)
+        talk_states.pop(message.from_user.id, None)
+        await send_approval(message.chat.id, post_id, generated)
+    except Exception as e:
+        logger.error(f"/done draft error: {e}")
+        await message.answer(f"❌ {e}")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    state = talk_states.pop(message.from_user.id, None)
+    if state:
+        from database import close_talk_session
+        await close_talk_session(pool, state["session_id"], status="cancelled")
+        await message.answer("🚫 Talk session cancelled.")
+        return
+    await message.answer("Nothing to cancel.")
+
+
 @router.message(Command("genvars"))
 async def cmd_genvars(message: Message):
     """Generate 3 distinct variants in different energy types so Robert can
@@ -1683,6 +1763,7 @@ async def cb_reject(callback: CallbackQuery):
 edit_states = {}
 reject_states = {}
 photo_upload_states = {}  # user_id -> post_id awaiting a photo
+talk_states = {}  # user_id -> {session_id, messages: [{role, text}, ...]}
 
 
 @router.callback_query(F.data.startswith("rerollimg:"))
@@ -1812,6 +1893,55 @@ async def cmd_context(message: Message):
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_free_text(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+
+    # Active /talk session — capture reply, ask follow-up, auto-finalize at 3
+    if message.from_user.id in talk_states:
+        state = talk_states[message.from_user.id]
+        state["messages"].append({"role": "user", "text": message.text})
+        try:
+            from database import append_talk_message, close_talk_session
+            await append_talk_message(
+                pool, state["session_id"], "user", message.text
+            )
+        except Exception as e:
+            logger.warning(f"talk persist user msg failed: {e}")
+
+        user_replies = [m for m in state["messages"] if m["role"] == "user"]
+
+        if len(user_replies) >= 3:
+            await message.answer("📝 Got enough — drafting post from your words...")
+            try:
+                from post_generator import generate_post_from_conversation
+                generated = await generate_post_from_conversation(
+                    state["messages"], pool=pool
+                )
+                post_id = await save_post(
+                    pool, [], generated["post_text"], generated.get("meme")
+                )
+                await close_talk_session(
+                    pool, state["session_id"], status="drafted", post_id=post_id
+                )
+                talk_states.pop(message.from_user.id, None)
+                await send_approval(message.chat.id, post_id, generated)
+            except Exception as e:
+                logger.error(f"/talk auto-finalize error: {e}")
+                await message.answer(f"❌ {e}")
+            return
+
+        # Otherwise ask one follow-up
+        try:
+            from post_generator import generate_followup_question
+            from database import append_talk_message
+            followup = await generate_followup_question(state["messages"])
+            state["messages"].append({"role": "bot", "text": followup})
+            await append_talk_message(
+                pool, state["session_id"], "bot", followup
+            )
+            await message.answer(f"💬 {followup}")
+        except Exception as e:
+            logger.error(f"/talk followup error: {e}")
+            await message.answer(f"❌ {e}")
         return
 
     # Handle regen feedback

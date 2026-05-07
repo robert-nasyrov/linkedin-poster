@@ -94,6 +94,21 @@ SYSTEM_PROMPT = f"""You write LinkedIn posts as Robert. Not for Robert — AS hi
 
 {ROBERT_CONTEXT}
 
+=== MATERIAL DISCIPLINE — READ THIS FIRST ===
+
+You may ONLY use stories, scenes, quotes, numbers, dialogue, names, and incidents that appear EXPLICITLY in the context provided to you (Robert's life digest, /context entries, top-performing posts, recent comments, talk-session transcripts, robert_context.md).
+
+You MUST NOT invent:
+- Client conversations ("my client said...")
+- Specific bug scenarios you weren't told about
+- Quotes from named people
+- Numbers, percentages, durations
+- Job/project specifics that aren't in the context
+
+If the context has NO concrete recent scene or detail — write a SHORT observation (50-80 words) on a real theme from the context. Don't pad to 200 words with imagined detail. Length should match material density: thin material → short post.
+
+The user has REPEATEDLY rejected drafts with "story is fake", "situation is fictional", "I don't have that in my actual experience". Material discipline is the single most important rule.
+
 === HOW TO WRITE ===
 
 Forget templates. Forget "5 tips" and "here's what I learned." Write like Robert actually thinks — sometimes it's a 3-line observation, sometimes it's a 250-word story. Let the topic decide the length and shape.
@@ -186,7 +201,7 @@ async def build_learning_context(pool) -> str:
     from database import (
         get_approved_posts, get_rejected_posts, get_user_context,
         get_top_posts, get_low_engagement_posts, get_recent_comments,
-        get_regen_feedback,
+        get_regen_feedback, get_recent_talk_transcripts,
     )
     from digest_reader import get_digest_context
 
@@ -309,6 +324,30 @@ async def build_learning_context(pool) -> str:
         items = "\n".join([f"- [{c['date']}] {c['text']}" for c in ctx])
         sections.append(f"=== RECENT CONTEXT UPDATES ===\n{items}")
 
+    # Talk transcripts — what Robert literally said in /talk sessions recently.
+    # Highest-fidelity source of real material; the discipline rule explicitly
+    # whitelists these.
+    try:
+        talks = await get_recent_talk_transcripts(pool, limit=3, days=30)
+        if talks:
+            chunks = []
+            for t in talks:
+                lines = []
+                for m in t["messages"]:
+                    who = "BOT" if m["role"] == "bot" else "ROBERT"
+                    lines.append(f"  {who}: {m['text']}")
+                chunks.append(
+                    f"Talk session {t['started_at'].date()}:\n" + "\n".join(lines)
+                )
+            sections.append(
+                "=== TALK SESSIONS (Robert's literal recent words — TREAT AS "
+                "PRIMARY MATERIAL FOR ANY POST. Do not paraphrase loosely; quote "
+                "or stay close to his actual phrases) ===\n"
+                + "\n\n".join(chunks)
+            )
+    except Exception as e:
+        logger.warning(f"Talk transcripts load failed: {e}")
+
     return "\n\n".join(sections)
 
 
@@ -341,6 +380,122 @@ async def generate_post_from_digest(digest_text: str, pool=None) -> dict:
         fact_check = await fact_check_post(client, post_text)
 
         await asyncio.sleep(3)
+        visual = await generate_visual(client, post_text)
+
+        return {"post_text": post_text, "meme": visual, "fact_check": fact_check}
+
+
+_OPENER_PROMPT = """You are warming Robert up to write a LinkedIn post by asking him ONE specific, probing question.
+
+Look at the context above (his life digest, /context entries, top posts, talk history). Pick the SINGLE most interesting recent moment, frustration, decision, or change — something concrete and unwritten.
+
+Ask ONE question — open enough to get a real story, specific enough that he can't dodge with vague answers. ONE SENTENCE. Direct. Personal.
+
+GOOD examples:
+- "What's the most absurd rejection reason you got from those LinkedIn job apps this week?"
+- "Did anything specific break in TrabajaYa today, or was it a quiet day?"
+- "Your dad's English progress — what did he say to you in his last lesson?"
+- "When did you decide to stop tracking impressions and start watching comments instead?"
+- "What part of the new bot are you avoiding writing because it scares you?"
+
+BAD examples (forbidden):
+- "How are things?"
+- "What's new?"
+- "Tell me about your week"
+- "What are you working on?"
+- Any opener that could apply to anyone
+
+Return ONLY the question text. No greetings, no labels, no quotes around it."""
+
+
+_FOLLOWUP_PROMPT = """Robert just answered. Your job: ask ONE follow-up question that pulls a SPECIFIC concrete detail out — a number, a name, a quote, a moment, a sensory detail, a mistake.
+
+Don't repeat his words. Probe deeper.
+
+GOOD follow-ups:
+- "What did the user literally type in that case?"
+- "Was that the moment you almost gave up on the project?"
+- "How long did you actually stare at the log before you saw it?"
+- "Who said that to you, and what was your reaction in the moment?"
+- "What was the smallest detail you almost missed?"
+
+BAD follow-ups (forbidden):
+- "Interesting, tell me more"
+- "What else?"
+- "Why?" (too lazy)
+- Anything generic
+
+Return ONLY the question text. ONE SENTENCE."""
+
+
+_FROM_TALK_PROMPT = """Below is a real Q&A conversation between Robert and the bot. Write a LinkedIn post grounded ONLY in what Robert literally said in his answers.
+
+CRITICAL RULES:
+- Use Robert's actual phrases and numbers from his answers — quote them when natural
+- Do NOT invent additional scenes, dialogue, characters, or details he didn't mention
+- If the material is thin (short or vague answers), write a SHORT post (50-80 words)
+- If the material is rich (specific numbers, scenes, quotes, names), write a 150-250 word story
+- Open with a line that reflects what Robert actually said — not a soft preamble
+
+Conversation:
+{transcript}
+
+Now write the post."""
+
+
+async def generate_opener_question(pool) -> str:
+    learning = await build_learning_context(pool) if pool else ""
+    async with httpx.AsyncClient(timeout=45) as client:
+        data = await claude_request(client, {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user",
+                 "content": (f"{learning}\n\n" if learning else "") + _OPENER_PROMPT}
+            ],
+        })
+    return data["content"][0]["text"].strip().strip('"').strip()
+
+
+async def generate_followup_question(messages: list[dict]) -> str:
+    transcript = "\n".join(
+        f"{'BOT' if m['role'] == 'bot' else 'ROBERT'}: {m['text']}"
+        for m in messages
+    )
+    async with httpx.AsyncClient(timeout=45) as client:
+        data = await claude_request(client, {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": f"{transcript}\n\n{_FOLLOWUP_PROMPT}"}
+            ],
+        })
+    return data["content"][0]["text"].strip().strip('"').strip()
+
+
+async def generate_post_from_conversation(messages: list[dict], pool=None) -> dict:
+    """Build a post from a /talk transcript using Robert's actual words as primary material."""
+    learning = await build_learning_context(pool) if pool else ""
+    transcript = "\n".join(
+        f"{'BOT' if m['role'] == 'bot' else 'ROBERT'}: {m['text']}"
+        for m in messages
+    )
+    async with httpx.AsyncClient(timeout=90) as client:
+        data = await claude_request(client, {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1200,
+            "system": SYSTEM_PROMPT,
+            "messages": [
+                {"role": "user",
+                 "content": ((f"{learning}\n\n" if learning else "")
+                             + _FROM_TALK_PROMPT.format(transcript=transcript))}
+            ],
+        })
+        post_text = clean_post_text(data["content"][0]["text"])
+
+        await asyncio.sleep(2)
+        fact_check = await fact_check_post(client, post_text)
+        await asyncio.sleep(2)
         visual = await generate_visual(client, post_text)
 
         return {"post_text": post_text, "meme": visual, "fact_check": fact_check}

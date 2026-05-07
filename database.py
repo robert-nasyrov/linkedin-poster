@@ -96,6 +96,28 @@ async def init_db(pool):
                 raw_cookies TEXT,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            -- /talk sessions: Robert and the bot exchange Q&A; the resulting
+            -- transcript becomes both the immediate post material AND a feed
+            -- into build_learning_context for future generations.
+            CREATE TABLE IF NOT EXISTS talk_sessions (
+                id SERIAL PRIMARY KEY,
+                started_at TIMESTAMPTZ DEFAULT NOW(),
+                finished_at TIMESTAMPTZ,
+                status TEXT DEFAULT 'open',
+                resulting_post_id INTEGER REFERENCES linkedin_posts(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS talk_messages (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER REFERENCES talk_sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_talk_messages_session
+                ON talk_messages(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_talk_sessions_finished_at
+                ON talk_sessions(finished_at DESC);
         """)
         # Safe migration if table existed before draft_text was added
         await conn.execute("""
@@ -417,6 +439,72 @@ async def save_post_comment(pool, post_id: int, platform: str, platform_comment_
                ON CONFLICT (platform, platform_comment_id) DO NOTHING""",
             post_id, platform, platform_comment_id, author, text
         )
+
+
+async def open_talk_session(pool) -> int:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO talk_sessions (started_at, status)
+               VALUES (NOW(), 'open') RETURNING id"""
+        )
+        return row["id"]
+
+
+async def append_talk_message(pool, session_id: int, role: str, text: str):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO talk_messages (session_id, role, text)
+               VALUES ($1, $2, $3)""",
+            session_id, role, text
+        )
+
+
+async def get_talk_messages(pool, session_id: int) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT role, text, created_at FROM talk_messages
+               WHERE session_id = $1 ORDER BY id""",
+            session_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def close_talk_session(pool, session_id: int, status: str = "drafted",
+                              post_id: int = None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE talk_sessions
+               SET finished_at = NOW(), status = $2, resulting_post_id = $3
+               WHERE id = $1""",
+            session_id, status, post_id
+        )
+
+
+async def get_recent_talk_transcripts(pool, limit: int = 3, days: int = 30):
+    """Recent finished talk sessions — fed into build_learning_context as a
+    'Robert literally said these things this week' source of authentic material."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT id, started_at, status FROM talk_sessions
+                WHERE finished_at IS NOT NULL
+                  AND finished_at > NOW() - INTERVAL '{int(days)} days'
+                  AND status IN ('drafted', 'posted', 'used')
+                ORDER BY finished_at DESC LIMIT $1""",
+            limit
+        )
+        sessions = []
+        for r in rows:
+            msgs = await conn.fetch(
+                """SELECT role, text FROM talk_messages
+                   WHERE session_id = $1 ORDER BY id""",
+                r["id"]
+            )
+            sessions.append({
+                "session_id": r["id"],
+                "started_at": r["started_at"],
+                "messages": [dict(m) for m in msgs],
+            })
+        return sessions
 
 
 async def save_linkedin_cookies(pool, li_at: str, jsessionid: str = None,
