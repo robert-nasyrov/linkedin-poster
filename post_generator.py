@@ -109,6 +109,14 @@ If the context has NO concrete recent scene or detail — write a SHORT observat
 
 The user has REPEATEDLY rejected drafts with "story is fake", "situation is fictional", "I don't have that in my actual experience". Material discipline is the single most important rule.
 
+=== TOPIC ROTATION — READ THIS SECOND ===
+
+Robert publishes one post at a time. If the context contains a "TOPIC LOCK" or "HARD TOPIC BLOCK" section, those topics are RECENTLY PUBLISHED. He will reject another post on the same subject — even a "different angle" on the same subject — even if the angle is genuinely fresh. He's said "I already posted about it" multiple times.
+
+Before writing, scan the TOPIC LOCK section and pick a SUBJECT not listed there. The context will offer many real threads (his job search, his dad's English, TrabajaYa, Pulse Bot, Telegrad, debugging, his daughter, life in Tashkent, his clients, paywalls, AI hype takes, etc). Use one Robert hasn't published about in the last 30 days.
+
+If literally every real subject in the context is in TOPIC LOCK, write a short observation (50-80 words) on something Robert mentioned in passing rather than recycling a published topic.
+
 === HOW TO WRITE ===
 
 Forget templates. Forget "5 tips" and "here's what I learned." Write like Robert actually thinks — sometimes it's a 3-line observation, sometimes it's a 250-word story. Let the topic decide the length and shape.
@@ -273,23 +281,67 @@ async def build_learning_context(pool) -> str:
     except Exception as e:
         logger.warning(f"Recent comments load failed: {e}")
 
-    # What posts Robert approved/rejected (his taste)
-    approved = await get_approved_posts(pool, limit=5)
+    # === TOPIC LOCK ===
+    # The single most common rejection signal in Robert's history is "I already
+    # posted about this". Surface the last 10 PUBLISHED posts (not all
+    # approved — specifically those that went out) as topics he must NOT cover
+    # again until they age out. This goes BEFORE other learning so the model
+    # sees it before anything that might pull it back to the same topic.
+    approved = await get_approved_posts(pool, limit=10)
     if approved:
-        examples = "\n---\n".join(approved[:3])
-        sections.append(f"=== POSTS ROBERT APPROVED (write more like these) ===\n{examples}")
+        topic_blocks = []
+        for body in approved[:10]:
+            preview = (body or "").strip()[:280].replace("\n", " ")
+            topic_blocks.append(f"- {preview}")
+        sections.append(
+            "=== TOPIC LOCK — Robert PUBLISHED these in the last ~30 days. "
+            "DO NOT write another post on the same topic, angle, or framing. "
+            "He will reject it. Pick a topic these don't cover. ===\n"
+            + "\n".join(topic_blocks)
+        )
 
-    rejected = await get_rejected_posts(pool, limit=5)
+    # === HARD TOPIC BLOCKS from rejects ===
+    # Rejects whose reason mentions "already / before / published / recently /
+    # repeated" are explicit "this exact topic is taken" signals from Robert.
+    # Treat them with longer retention and stronger language than generic rejects.
+    rejected = await get_rejected_posts(pool, limit=10)
     if rejected:
-        examples = "\n---\n".join([f"POST: {r['text'][:200]}...\nWHY REJECTED: {r['reason']}" for r in rejected[:3]])
-        sections.append(f"=== POSTS ROBERT REJECTED (avoid this style/tone/topic) ===\n{examples}")
+        hard_blocks = []
+        soft_rejects = []
+        block_markers = ("already", "before", "published", "recently", "repeat",
+                          "same", "had this kind", "wrote about", "posted about")
+        for r in rejected:
+            reason_l = (r["reason"] or "").lower()
+            if any(m in reason_l for m in block_markers):
+                hard_blocks.append(r)
+            else:
+                soft_rejects.append(r)
 
-    # Anti-repetition: surface the OPENING LINES of recent approved posts.
-    # Robert's strongest rejection signal is "another post that opens like the
-    # last one" — so feed Claude the literal first lines as a forbidden list.
+        if hard_blocks:
+            blob = "\n---\n".join(
+                f"POST: {r['text'][:300]}...\nWHY BLOCKED: {r['reason']}"
+                for r in hard_blocks[:5]
+            )
+            sections.append(
+                "=== HARD TOPIC BLOCK — Robert explicitly said 'I already posted "
+                "about this' for these. Pick a DIFFERENT topic, not a different "
+                "angle on the same one. ===\n" + blob
+            )
+
+        if soft_rejects:
+            blob = "\n---\n".join(
+                f"POST: {r['text'][:200]}...\nWHY REJECTED: {r['reason']}"
+                for r in soft_rejects[:3]
+            )
+            sections.append(
+                "=== REJECTED FOR STYLE/EXECUTION (not topic) — avoid this tone "
+                "or framing in new posts ===\n" + blob
+            )
+
+    # Anti-repetition: surface the OPENING LINES of recent published posts.
     if approved:
         opens = []
-        for body in approved[:7]:
+        for body in approved[:10]:
             first_line = (body or "").strip().split("\n", 1)[0][:120]
             if first_line:
                 opens.append(first_line)
@@ -299,6 +351,17 @@ async def build_learning_context(pool) -> str:
                 "STRUCTURALLY SIMILAR TO ANY OF THESE ===\n"
                 + "\n".join(f"- {o}" for o in opens)
             )
+
+    # === STYLE REFERENCE only (NOT topic templates) ===
+    # Approved posts as style/voice samples — the model should learn the VOICE,
+    # not the SUBJECT. Topic lock above already forbids re-using subjects.
+    if approved:
+        style_samples = "\n---\n".join(approved[:2])
+        sections.append(
+            "=== VOICE/STYLE REFERENCE (study HOW Robert writes — sentence rhythm, "
+            "specificity, punctuation. Do NOT reuse the TOPIC or OPENING of these. "
+            "Topic lock above is enforced.) ===\n" + style_samples
+        )
 
     # REGENERATE FEEDBACK — what Robert said when he asked to redo a draft.
     # These are stronger taste signals than rejects (he wanted the topic, just wrong execution).
