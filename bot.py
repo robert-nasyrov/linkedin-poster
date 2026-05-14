@@ -16,6 +16,7 @@ import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand, BotCommandScopeChat,
     URLInputFile,
 )
 from aiogram.filters import Command
@@ -98,20 +99,145 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _persistent_keyboard() -> ReplyKeyboardMarkup:
+    """Always-visible action keyboard at the bottom of chat. Each button label
+    is matched by F.text handlers below and dispatched to the same logic as
+    the inline /menu callbacks."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 Темы"), KeyboardButton(text="💬 Talk")],
+            [KeyboardButton(text="🎲 Generate"), KeyboardButton(text="📋 Меню")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 @router.message(Command("start"))
-@router.message(Command("menu"))
 async def cmd_start(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
     await message.answer(
-        "🚀 *LinkedIn + Threads Bot*\n\n"
-        "Tap a button. /menu brings this back any time.\n\n"
-        "Other commands still work:\n"
-        "• /write <topic>, /twrite <topic>, /post <text>\n"
-        "• /find, /comment <url>\n"
-        "• /connect, /threads, /relink_li\n"
-        "• /repost <id>, /limport, /lpic, /lbulk, /lcomments",
-        parse_mode="Markdown",
+        "🚀 LinkedIn + Threads Bot\n\n"
+        "Tap a button at the bottom. /menu brings the full grid.",
+        reply_markup=_persistent_keyboard(),
+    )
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await message.answer(
+        "📋 Main menu — pick an action:",
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
+# Reply-keyboard text buttons map to the same handlers as inline /menu callbacks
+async def _trigger_suggest(message: Message):
+    """Inline-equivalent of cb_menu_suggest, but for a Message instead of Callback."""
+    await message.answer("Scanning context for fresh angles...")
+    try:
+        from post_generator import suggest_fresh_topics
+        suggestions = await suggest_fresh_topics(pool)
+    except Exception as e:
+        logger.error(f"Suggest error: {e}")
+        await message.answer(f"❌ {e}")
+        return
+    if not suggestions:
+        await message.answer(
+            "No fresh angles surfaced. Try 💬 Talk for raw material."
+        )
+        return
+    suggestion_cache[message.from_user.id] = suggestions
+    rows = ["🎯 Fresh angles for today:\n"]
+    for i, s in enumerate(suggestions[:5], 1):
+        title = s.get("title", f"Option {i}")
+        hook = (s.get("hook") or "")[:140]
+        rows.append(f"{i}. {title}\n{hook}")
+    rows.append("\nTap a number to draft from that angle:")
+    buttons = [
+        [InlineKeyboardButton(text=f"{i+1}", callback_data=f"suggest_pick:{i}")
+         for i in range(min(5, len(suggestions)))]
+    ]
+    buttons.append([InlineKeyboardButton(text="🔄 New suggestions", callback_data="menu:suggest")])
+    await message.answer(
+        "\n\n".join(rows),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+async def _trigger_talk(message: Message):
+    if message.from_user.id in talk_states:
+        await message.answer("Talk session already running. /done to finalize, /cancel to drop.")
+        return
+    try:
+        from post_generator import generate_opener_question
+        from database import open_talk_session, append_talk_message
+        question = await generate_opener_question(pool)
+        session_id = await open_talk_session(pool)
+        await append_talk_message(pool, session_id, "bot", question)
+        talk_states[message.from_user.id] = {
+            "session_id": session_id,
+            "messages": [{"role": "bot", "text": question}],
+        }
+        await message.answer(
+            f"💬 {question}\n\n(After ~3 exchanges I'll draft a post. /done early, /cancel drops.)"
+        )
+    except Exception as e:
+        logger.error(f"_trigger_talk error: {e}")
+        await message.answer(f"❌ {e}")
+
+
+async def _trigger_generate(message: Message):
+    await message.answer("🧠 Generating from your life context...")
+    try:
+        from post_generator import build_learning_context as _blc
+        from digest_reader import get_digest_context
+        life_context = await get_digest_context()
+        learning = await _blc(pool)
+        combined = (life_context + "\n\n" if life_context else "") + (learning or "")
+        if not combined.strip():
+            await message.answer(
+                "No context yet. Tap 💬 Talk or send /context <thought>."
+            )
+            return
+        generated = await generate_post_from_digest(combined, pool=pool)
+        post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
+        await send_approval(message.chat.id, post_id, generated)
+    except Exception as e:
+        logger.error(f"_trigger_generate error: {e}")
+        await message.answer(f"❌ {e}")
+
+
+@router.message(F.text == "🎯 Темы")
+async def kb_suggest(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await _trigger_suggest(message)
+
+
+@router.message(F.text == "💬 Talk")
+async def kb_talk(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await _trigger_talk(message)
+
+
+@router.message(F.text == "🎲 Generate")
+async def kb_generate(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await _trigger_generate(message)
+
+
+@router.message(F.text == "📋 Меню")
+async def kb_menu(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await message.answer(
+        "📋 Main menu — pick an action:",
         reply_markup=_main_menu_keyboard(),
     )
 
@@ -2649,6 +2775,31 @@ async def main():
     asyncio.create_task(scheduled_post_generation())
     asyncio.create_task(scheduled_stats_collection())
     logger.info(f"Scheduler started: days={POST_DAYS}, hour={POST_HOUR}:00 UZT")
+
+    # Register bot commands so the blue "Menu" button (bottom-left) lists them.
+    # Scope to the admin chat only so other users can't see admin commands.
+    try:
+        commands = [
+            BotCommand(command="menu", description="🚀 Main menu"),
+            BotCommand(command="generate", description="🎲 Auto-generate from context"),
+            BotCommand(command="talk", description="💬 Q&A → post from your words"),
+            BotCommand(command="genvars", description="🔀 3 variants in different styles"),
+            BotCommand(command="write", description="✍️ Write from a thought"),
+            BotCommand(command="context", description="📝 Save a life/work note"),
+            BotCommand(command="stats", description="📊 Top posts"),
+            BotCommand(command="status", description="🔌 Connections status"),
+            BotCommand(command="limport", description="📥 Import LinkedIn XLSX"),
+            BotCommand(command="repost", description="🔁 Re-show approval for a draft"),
+            BotCommand(command="connect", description="LinkedIn OAuth"),
+            BotCommand(command="threads", description="Threads OAuth"),
+        ]
+        await bot.set_my_commands(
+            commands,
+            scope=BotCommandScopeChat(chat_id=TELEGRAM_ADMIN_ID),
+        )
+        logger.info("Registered bot commands for admin chat")
+    except Exception as e:
+        logger.warning(f"set_my_commands failed: {e}")
 
     # Start bot
     logger.info("Bot starting...")
