@@ -73,27 +73,336 @@ async def get_threads_token_or_env(pool):
 
 # ==================== TELEGRAM COMMANDS ====================
 
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎯 Suggest topics", callback_data="menu:suggest"),
+            InlineKeyboardButton(text="💬 Talk it out", callback_data="menu:talk"),
+        ],
+        [
+            InlineKeyboardButton(text="🎲 Auto-generate", callback_data="menu:generate"),
+            InlineKeyboardButton(text="🔀 3 variants", callback_data="menu:genvars"),
+        ],
+        [
+            InlineKeyboardButton(text="✍️ From thought", callback_data="menu:write"),
+            InlineKeyboardButton(text="📝 Add context", callback_data="menu:context"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 Retire topic", callback_data="menu:retire"),
+            InlineKeyboardButton(text="📋 Show retired", callback_data="menu:retired_list"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Stats", callback_data="menu:stats"),
+            InlineKeyboardButton(text="🔌 Status", callback_data="menu:status"),
+        ],
+    ])
+
+
 @router.message(Command("start"))
+@router.message(Command("menu"))
 async def cmd_start(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
     await message.answer(
-        "🚀 *LinkedIn + Threads Auto-Poster Bot*\n\n"
-        "Posts:\n"
-        "/generate — Auto-generate post from your life context\n"
-        "/write <topic> — Write post from your thought\n"
-        "/twrite <topic> — Write for Threads (thread chains)\n"
-        "/post <text> — Post ready text directly (no AI)\n\n"
-        "Comments:\n"
-        "/find — Find posts to comment on\n"
-        "/comment <url> — Generate comment for a post\n\n"
-        "Settings:\n"
-        "/context <update> — Add context about your life/work\n"
-        "/stats — See top performing posts\n"
-        "/connect — Connect LinkedIn account\n"
-        "/threads — Connect Threads account\n"
-        "/status — Check bot & token status\n",
-        parse_mode="Markdown"
+        "🚀 *LinkedIn + Threads Bot*\n\n"
+        "Tap a button. /menu brings this back any time.\n\n"
+        "Other commands still work:\n"
+        "• /write <topic>, /twrite <topic>, /post <text>\n"
+        "• /find, /comment <url>\n"
+        "• /connect, /threads, /relink_li\n"
+        "• /repost <id>, /limport, /lpic, /lbulk, /lcomments",
+        parse_mode="Markdown",
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
+# === Menu callbacks ===
+
+# State buckets for menu-triggered input modes
+menu_input_states = {}  # user_id -> "context" | "write" | "retire" | "retire_revive"
+
+
+@router.callback_query(F.data == "menu:suggest")
+async def cb_menu_suggest(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer("Scanning context for fresh angles...")
+    try:
+        from post_generator import suggest_fresh_topics
+        suggestions = await suggest_fresh_topics(pool)
+    except Exception as e:
+        logger.error(f"Suggest topics error: {e}")
+        await callback.message.answer(f"❌ {e}")
+        return
+
+    if not suggestions:
+        await callback.message.answer(
+            "No fresh angles surfaced — either context is thin or "
+            "everything is topic-locked. Try /talk for raw material."
+        )
+        return
+
+    # Cache suggestions so the "pick #N" callback can find them
+    suggestion_cache[callback.from_user.id] = suggestions
+
+    rows = ["🎯 *Fresh angles for today:*\n"]
+    for i, s in enumerate(suggestions[:5], 1):
+        title = s.get("title", f"Option {i}")
+        hook = (s.get("hook") or "")[:140]
+        rows.append(f"*{i}. {title}*\n_{hook}_")
+    rows.append("\nTap a button to draft from that angle:")
+
+    buttons = [
+        [InlineKeyboardButton(text=f"{i+1}", callback_data=f"suggest_pick:{i}")
+         for i in range(min(5, len(suggestions)))]
+    ]
+    buttons.append([InlineKeyboardButton(text="🔄 New suggestions", callback_data="menu:suggest"),
+                    InlineKeyboardButton(text="↩️ Back", callback_data="menu:back")])
+
+    await callback.message.answer(
+        "\n\n".join(rows),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+suggestion_cache = {}  # user_id -> list of suggestion dicts
+
+
+@router.callback_query(F.data.startswith("suggest_pick:"))
+async def cb_suggest_pick(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    idx = int(callback.data.split(":")[1])
+    suggestions = suggestion_cache.get(callback.from_user.id, [])
+    if idx >= len(suggestions):
+        await callback.answer("Suggestion expired, tap 'Suggest topics' again.", show_alert=True)
+        return
+    pick = suggestions[idx]
+    topic_prompt = f"{pick.get('title', '')}: {pick.get('hook', '')}".strip(": ").strip()
+
+    await callback.answer("Generating draft from that angle...")
+    try:
+        generated = await generate_post_from_topic(topic_prompt, pool=pool)
+        post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
+        await send_approval(callback.message.chat.id, post_id, generated)
+    except Exception as e:
+        logger.error(f"Generate-from-suggestion error: {e}")
+        await callback.message.answer(f"❌ {e}")
+
+
+@router.callback_query(F.data == "menu:talk")
+async def cb_menu_talk(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    if callback.from_user.id in talk_states:
+        await callback.answer("Talk session already running.", show_alert=True)
+        return
+    await callback.answer("Starting talk session...")
+    try:
+        from post_generator import generate_opener_question
+        from database import open_talk_session, append_talk_message
+        question = await generate_opener_question(pool)
+        session_id = await open_talk_session(pool)
+        await append_talk_message(pool, session_id, "bot", question)
+        talk_states[callback.from_user.id] = {
+            "session_id": session_id,
+            "messages": [{"role": "bot", "text": question}],
+        }
+        await callback.message.answer(
+            f"💬 {question}\n\n_(Reply with what's true. After ~3 exchanges I'll "
+            f"draft a post. /done to finalize early. /cancel to drop.)_",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"menu:talk error: {e}")
+        await callback.message.answer(f"❌ {e}")
+
+
+@router.callback_query(F.data == "menu:generate")
+async def cb_menu_generate(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer("Generating from life context...")
+    try:
+        from post_generator import build_learning_context as _blc
+        from digest_reader import get_digest_context
+        life_context = await get_digest_context()
+        learning = await _blc(pool)
+        combined = (life_context + "\n\n" if life_context else "") + (learning or "")
+        if not combined.strip():
+            await callback.message.answer(
+                "No context yet. Add some with 📝 Add context or 💬 Talk it out."
+            )
+            return
+        generated = await generate_post_from_digest(combined, pool=pool)
+        post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
+        await send_approval(callback.message.chat.id, post_id, generated)
+    except Exception as e:
+        logger.error(f"menu:generate error: {e}")
+        await callback.message.answer(f"❌ {e}")
+
+
+@router.callback_query(F.data == "menu:genvars")
+async def cb_menu_genvars(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer("Generating 3 variants...")
+    try:
+        from post_generator import generate_post_variants, build_learning_context as _blc
+        from digest_reader import get_digest_context
+        life_context = await get_digest_context()
+        learning = await _blc(pool)
+        combined = (life_context + "\n\n" if life_context else "") + (learning or "")
+        if not combined.strip():
+            await callback.message.answer("No context yet. Talk it out first.")
+            return
+        variants = await generate_post_variants(combined, pool=pool, count=3, source_kind="digest")
+    except Exception as e:
+        logger.error(f"menu:genvars error: {e}")
+        await callback.message.answer(f"❌ {e}")
+        return
+    if not variants:
+        await callback.message.answer("No variants returned.")
+        return
+    await callback.message.answer(f"Got {len(variants)} variants. Pick your favorite.")
+    for v in variants:
+        post_id = await save_post(pool, [], v["post_text"], v.get("meme"))
+        prefixed = {
+            "post_text": f"[{v['energy']}]\n\n{v['post_text']}",
+            "meme": v.get("meme"),
+            "fact_check": v.get("fact_check"),
+        }
+        await send_approval(callback.message.chat.id, post_id, prefixed)
+
+
+@router.callback_query(F.data == "menu:write")
+async def cb_menu_write(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    menu_input_states[callback.from_user.id] = "write"
+    await callback.message.answer(
+        "✍️ Send me the thought/topic you want a post about. (/cancel to drop)"
+    )
+
+
+@router.callback_query(F.data == "menu:context")
+async def cb_menu_context(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    menu_input_states[callback.from_user.id] = "context"
+    await callback.message.answer(
+        "📝 Send the fact/update to remember about your life or work. (/cancel to drop)"
+    )
+
+
+@router.callback_query(F.data == "menu:retire")
+async def cb_menu_retire(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    menu_input_states[callback.from_user.id] = "retire"
+    await callback.message.answer(
+        "🚫 Send the keyword/project to retire (e.g. 'TrabajaYa' or "
+        "'TrabajaYa — project closed 2026-03'). The bot will stop mentioning it. "
+        "(/cancel to drop)"
+    )
+
+
+@router.callback_query(F.data == "menu:retired_list")
+async def cb_menu_retired_list(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    from database import get_retired_topics
+    items = await get_retired_topics(pool)
+    if not items:
+        await callback.answer()
+        await callback.message.answer("Nothing retired yet. Tap 🚫 Retire topic to add.")
+        return
+    await callback.answer()
+    lines = ["🗂 *Retired topics (bot won't mention):*\n"]
+    for r in items:
+        line = f"• {r['keyword']}"
+        if r['note']:
+            line += f" — _{r['note']}_"
+        lines.append(line)
+    lines.append("\n_Send /unretire <keyword> to revive._")
+    await callback.message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "menu:stats")
+async def cb_menu_stats(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    # Reuse the existing /stats logic by calling the underlying handler via a synthetic message
+    from database import get_top_posts
+    top = await get_top_posts(pool, limit=5)
+    if not top:
+        await callback.message.answer(
+            "📊 No engagement data yet. Run /limport with your LinkedIn XLSX, "
+            "or wait for daily Threads collection."
+        )
+        return
+    lines = ["📊 *Top performing posts:*\n"]
+    for i, p in enumerate(top):
+        preview = (p["post_text"] or "")[:80].replace("\n", " ")
+        lines.append(
+            f"{i+1}. [{p['platform'].upper()}] {p['likes']}❤️ {p['comments']}💬 "
+            f"{p['shares']}🔄 {p.get('views', 0)}👁\n   {preview}..."
+        )
+    await callback.message.answer("\n\n".join(lines), parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "menu:status")
+async def cb_menu_status(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    li = await get_linkedin_token(pool)
+    th = await get_threads_token_or_env(pool)
+    lines = ["*Connections:*\n"]
+    if li:
+        valid = await check_token_valid(li["access_token"])
+        exp = li["expires_at"].strftime("%Y-%m-%d") if li.get("expires_at") else "?"
+        lines.append(f"LinkedIn OAuth: {'✅' if valid else '❌'} (expires {exp})")
+    else:
+        lines.append("LinkedIn OAuth: ❌ /connect")
+    if th:
+        exp = th["expires_at"].strftime("%Y-%m-%d") if th.get("expires_at") else "?"
+        lines.append(f"Threads: ✅ (expires {exp})")
+    else:
+        lines.append("Threads: ❌ /threads")
+    await callback.message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "menu:back")
+async def cb_menu_back(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "🚀 *LinkedIn + Threads Bot*",
+        parse_mode="Markdown",
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
+@router.message(Command("unretire"))
+async def cmd_unretire(message: Message):
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    arg = (message.text or "").replace("/unretire", "", 1).strip()
+    if not arg:
+        await message.answer("Usage: /unretire <keyword>")
+        return
+    from database import remove_retired_topic
+    ok = await remove_retired_topic(pool, arg)
+    await message.answer(
+        f"✅ Removed '{arg}' from retired list." if ok
+        else f"'{arg}' not in retired list."
     )
 
 
@@ -904,6 +1213,10 @@ async def cmd_done(message: Message):
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    if message.from_user.id in menu_input_states:
+        menu_input_states.pop(message.from_user.id)
+        await message.answer("🚫 Cancelled.")
         return
     state = talk_states.pop(message.from_user.id, None)
     if state:
@@ -1944,6 +2257,60 @@ async def cmd_context(message: Message):
 async def handle_free_text(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
         return
+
+    # Menu-triggered single-input flows (write / context / retire)
+    if message.from_user.id in menu_input_states:
+        mode = menu_input_states.pop(message.from_user.id)
+        text = message.text.strip()
+
+        if mode == "write":
+            await message.answer("🧠 Generating post from your thought...")
+            try:
+                generated = await generate_post_from_topic(text, pool=pool)
+                post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
+                await send_approval(message.chat.id, post_id, generated)
+            except Exception as e:
+                logger.error(f"menu:write input error: {e}")
+                await message.answer(f"❌ {e}")
+            return
+
+        if mode == "context":
+            from database import add_user_context
+            await add_user_context(pool, text)
+            # Also push to digest DB so /generate sees it
+            import os
+            digest_db_url = os.getenv("DIGEST_DATABASE_URL", "")
+            if digest_db_url:
+                try:
+                    import asyncpg as _ap
+                    conn = await _ap.connect(digest_db_url, timeout=10)
+                    await conn.execute(
+                        "INSERT INTO life_context (context, updated_at) VALUES ($1, NOW())",
+                        text,
+                    )
+                    await conn.close()
+                except Exception as e:
+                    logger.warning(f"context push to digest DB failed: {e}")
+            await message.answer(f"✅ Saved: {text[:100]}{'...' if len(text) > 100 else ''}")
+            return
+
+        if mode == "retire":
+            # Accept "Keyword — note" or just "Keyword"
+            if "—" in text:
+                kw, _, note = text.partition("—")
+            elif " - " in text:
+                kw, _, note = text.partition(" - ")
+            else:
+                kw, note = text, ""
+            kw = kw.strip()
+            note = note.strip() or None
+            from database import add_retired_topic
+            await add_retired_topic(pool, kw, note)
+            await message.answer(
+                f"🚫 '{kw}' retired. Bot will stop mentioning it in new posts."
+                + (f"\nNote: {note}" if note else "")
+            )
+            return
 
     # Active /talk session — capture reply, ask follow-up, auto-finalize at 3
     if message.from_user.id in talk_states:

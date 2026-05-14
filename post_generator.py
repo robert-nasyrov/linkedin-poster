@@ -209,11 +209,30 @@ async def build_learning_context(pool) -> str:
     from database import (
         get_approved_posts, get_rejected_posts, get_user_context,
         get_top_posts, get_low_engagement_posts, get_recent_comments,
-        get_regen_feedback, get_recent_talk_transcripts,
+        get_regen_feedback, get_recent_talk_transcripts, get_retired_topics,
     )
     from digest_reader import get_digest_context
 
     sections = []
+
+    # === RETIRED TOPICS — absolute front. These are projects Robert explicitly
+    # marked as "stop mentioning". Even if they appear in life context or in
+    # robert_context.md, treat them as off-limits.
+    try:
+        retired = await get_retired_topics(pool)
+        if retired:
+            lines = []
+            for r in retired:
+                if r["note"]:
+                    lines.append(f"- {r['keyword']} — {r['note']}")
+                else:
+                    lines.append(f"- {r['keyword']}")
+            sections.append(
+                "=== RETIRED — DO NOT MENTION THESE IN ANY POST ===\n"
+                + "\n".join(lines)
+            )
+    except Exception as e:
+        logger.warning(f"Retired topics load failed: {e}")
 
     # What's happening in Robert's life (from Pulse Bot + digest DB)
     try:
@@ -504,6 +523,45 @@ Conversation:
 {transcript}
 
 Now write the post."""
+
+
+_SUGGEST_PROMPT = """You're helping Robert pick what to write a LinkedIn post about TODAY.
+
+The context above contains his current life, the topics he ALREADY posted on (TOPIC LOCK), retired projects (DO NOT MENTION), reader comments, etc.
+
+Propose exactly 5 fresh post angles. Each MUST:
+- Be grounded in something specific from the context (a name, an event, a number, a quote, a struggle)
+- Avoid every topic in TOPIC LOCK / HARD TOPIC BLOCK / RETIRED
+- Have a concrete opening line, not "thoughts on X" generic
+- Be different from each other in subject — not 5 variations of the same theme
+
+Return ONLY a JSON array, no markdown:
+[
+  {"title": "5-10 word topic name", "hook": "the actual first line of the post", "why_fresh": "one sentence why this isn't a repeat"},
+  ...
+]"""
+
+
+async def suggest_fresh_topics(pool) -> list[dict]:
+    """Ask Claude to scan everything and propose 5 fresh post angles."""
+    learning = await build_learning_context(pool) if pool else ""
+    async with httpx.AsyncClient(timeout=60) as client:
+        data = await claude_request(client, {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1500,
+            "messages": [
+                {"role": "user", "content": f"{learning}\n\n{_SUGGEST_PROMPT}"}
+            ],
+        })
+    raw = data["content"][0]["text"].strip()
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    start = cleaned.find("[")
+    end = cleaned.rfind("]") + 1
+    try:
+        return json.loads(cleaned[start:end])
+    except Exception as e:
+        logger.error(f"Suggest parse failed: {e}; raw: {raw[:400]}")
+        return []
 
 
 async def generate_opener_question(pool) -> str:

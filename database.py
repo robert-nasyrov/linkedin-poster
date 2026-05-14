@@ -118,6 +118,15 @@ async def init_db(pool):
                 ON talk_messages(session_id, id);
             CREATE INDEX IF NOT EXISTS idx_talk_sessions_finished_at
                 ON talk_sessions(finished_at DESC);
+
+            -- Robert can retire a project/topic ("TrabajaYa is dead, stop
+            -- mentioning it"). Inject into prompt as DO-NOT-MENTION list.
+            CREATE TABLE IF NOT EXISTS retired_topics (
+                id SERIAL PRIMARY KEY,
+                keyword TEXT NOT NULL UNIQUE,
+                note TEXT,
+                retired_at TIMESTAMPTZ DEFAULT NOW()
+            );
         """)
         # Safe migration if table existed before draft_text was added
         await conn.execute("""
@@ -478,6 +487,34 @@ async def close_talk_session(pool, session_id: int, status: str = "drafted",
                WHERE id = $1""",
             session_id, status, post_id
         )
+
+
+async def add_retired_topic(pool, keyword: str, note: str = None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO retired_topics (keyword, note)
+               VALUES ($1, $2)
+               ON CONFLICT (keyword) DO UPDATE SET note = EXCLUDED.note,
+                                                    retired_at = NOW()""",
+            keyword.strip(), note
+        )
+
+
+async def remove_retired_topic(pool, keyword: str):
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM retired_topics WHERE LOWER(keyword) = LOWER($1)",
+            keyword.strip()
+        )
+        return result.endswith(" 1")
+
+
+async def get_retired_topics(pool) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT keyword, note, retired_at FROM retired_topics ORDER BY retired_at DESC"
+        )
+        return [dict(r) for r in rows]
 
 
 async def get_recent_talk_transcripts(pool, limit: int = 3, days: int = 30):
