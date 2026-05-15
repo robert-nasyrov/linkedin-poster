@@ -516,6 +516,74 @@ async def cb_menu_back(callback: CallbackQuery):
     )
 
 
+@router.message(Command("pillars"))
+async def cmd_pillars(message: Message):
+    """Show current content pillars + buttons to add/remove."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    from database import get_content_pillars
+    pillars = await get_content_pillars(pool)
+
+    if not pillars:
+        await message.answer(
+            "No content pillars yet.\n"
+            "Tap 'Add' to define a topic territory you want to own."
+        )
+    else:
+        lines = ["📌 *Content pillars — bot writes ONLY within these:*\n"]
+        for p in pillars:
+            priority_tag = {1: "🟢", 2: "🟡", 3: "🔴"}.get(p["priority"], "•")
+            lines.append(f"{priority_tag} *#{p['id']} {p['title']}*")
+            if p["description"]:
+                lines.append(f"_{p['description'][:200]}_")
+            if p["keywords"]:
+                lines.append(f"keywords: `{p['keywords']}`")
+            lines.append("")
+        await message.answer(
+            "\n".join(lines), parse_mode="Markdown"
+        )
+
+    buttons = [
+        [InlineKeyboardButton(text="➕ Add pillar", callback_data="pillar:add")],
+    ]
+    if pillars:
+        # Show delete buttons for each
+        for p in pillars:
+            buttons.append([InlineKeyboardButton(
+                text=f"🗑 Remove #{p['id']} {p['title'][:30]}",
+                callback_data=f"pillar:del:{p['id']}",
+            )])
+    await message.answer("Manage:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "pillar:add")
+async def cb_pillar_add(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    menu_input_states[callback.from_user.id] = "pillar_add"
+    await callback.message.answer(
+        "Send the new pillar as:\n"
+        "`Title | description | keywords | priority(1-3)`\n\n"
+        "Example:\n"
+        "`Self-hosted bots | Building production bots without managed AI services | self-hosted, fly.io, ollama, llama.cpp | 1`\n\n"
+        "Pipe-separated, priority optional (defaults to 1). /cancel to drop.",
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data.startswith("pillar:del:"))
+async def cb_pillar_del(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    pillar_id = int(callback.data.split(":")[2])
+    from database import remove_content_pillar
+    ok = await remove_content_pillar(pool, pillar_id)
+    await callback.answer("Removed" if ok else "Not found", show_alert=False)
+    # Re-show the pillars list
+    await cmd_pillars(callback.message)
+
+
 @router.message(Command("unretire"))
 async def cmd_unretire(message: Message):
     if message.from_user.id != TELEGRAM_ADMIN_ID:
@@ -2436,6 +2504,24 @@ async def handle_free_text(message: Message):
                 f"🚫 '{kw}' retired. Bot will stop mentioning it in new posts."
                 + (f"\nNote: {note}" if note else "")
             )
+            return
+
+        if mode == "pillar_add":
+            parts = [p.strip() for p in text.split("|")]
+            if not parts or not parts[0]:
+                await message.answer("❌ Empty title. Drop.")
+                return
+            title = parts[0]
+            description = parts[1] if len(parts) > 1 else None
+            keywords = parts[2] if len(parts) > 2 else None
+            try:
+                priority = int(parts[3]) if len(parts) > 3 else 1
+                priority = max(1, min(3, priority))
+            except ValueError:
+                priority = 1
+            from database import add_content_pillar
+            pillar_id = await add_content_pillar(pool, title, description, keywords, priority)
+            await message.answer(f"📌 Pillar #{pillar_id} added: {title}")
             return
 
     # Active /talk session — capture reply, ask follow-up, auto-finalize at 3

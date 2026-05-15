@@ -127,6 +127,18 @@ async def init_db(pool):
                 note TEXT,
                 retired_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            -- Content pillars: the 2-3 topic territories Robert wants to own
+            -- in his audience's minds. Bot filters generation to stay within
+            -- these — everything else is off-strategy and not worth posting.
+            CREATE TABLE IF NOT EXISTS content_pillars (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT,
+                keywords TEXT,
+                priority INTEGER DEFAULT 1,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
         """)
         # Safe migration if table existed before draft_text was added
         await conn.execute("""
@@ -143,6 +155,34 @@ async def init_db(pool):
                 ALTER TABLE linkedin_posts ADD COLUMN IF NOT EXISTS linkedin_activity_urn TEXT;
                 ALTER TABLE linkedin_cookies ADD COLUMN IF NOT EXISTS raw_cookies TEXT;
             EXCEPTION WHEN others THEN NULL;
+            END $$;
+        """)
+
+        # Seed Robert's initial content pillars on first run. These are
+        # opinionated defaults based on what's underleveraged in his profile:
+        # "12 systems in 18 months", "Deterministic LLM Programming" as a
+        # skill, and Tashkent → global market arbitrage. He can edit via
+        # /pillars.
+        await conn.execute("""
+            DO $$
+            DECLARE pillar_count INTEGER;
+            BEGIN
+                SELECT COUNT(*) INTO pillar_count FROM content_pillars;
+                IF pillar_count = 0 THEN
+                    INSERT INTO content_pillars (title, description, keywords, priority) VALUES
+                    ('Production AI at real scale',
+                     'War stories, incidents, architecture decisions, and metrics from running 12+ AI systems autonomously — TrabajaYa processed 3,600+ candidates. Not tutorials, not hype. Concrete numbers and what broke.',
+                     'production, scale, incident, postmortem, architecture, autonomy, metrics, error handling, deployment, monitoring',
+                     1),
+                    ('Deterministic LLM Programming',
+                     'The methodology of building LLM-powered systems that behave reliably and reproducibly. Patterns, anti-patterns, prompting discipline, output validation, schema enforcement, fallback design. This is Robert''s skill brand.',
+                     'deterministic, reproducible, schema, validation, structured output, JSON, retries, idempotency, prompt patterns',
+                     1),
+                    ('Tashkent → global market arbitrage',
+                     'Building AI work from Tashkent for English-speaking / LATAM clients. The visible-from-here truth about timezone bias, hiring filters, contracting from non-SF locations, and what arbitrage actually looks like.',
+                     'remote, timezone, Tashkent, hiring bias, arbitrage, geography, freelance, contracts, English market',
+                     1);
+                END IF;
             END $$;
         """)
 
@@ -487,6 +527,34 @@ async def close_talk_session(pool, session_id: int, status: str = "drafted",
                WHERE id = $1""",
             session_id, status, post_id
         )
+
+
+async def get_content_pillars(pool) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, title, description, keywords, priority FROM content_pillars
+               ORDER BY priority, id"""
+        )
+        return [dict(r) for r in rows]
+
+
+async def add_content_pillar(pool, title: str, description: str = None,
+                              keywords: str = None, priority: int = 1):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO content_pillars (title, description, keywords, priority)
+               VALUES ($1, $2, $3, $4) RETURNING id""",
+            title.strip(), description, keywords, priority,
+        )
+        return row["id"]
+
+
+async def remove_content_pillar(pool, pillar_id: int) -> bool:
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM content_pillars WHERE id = $1", pillar_id
+        )
+        return result.endswith(" 1")
 
 
 async def add_retired_topic(pool, keyword: str, note: str = None):

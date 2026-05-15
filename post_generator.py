@@ -210,10 +210,46 @@ async def build_learning_context(pool) -> str:
         get_approved_posts, get_rejected_posts, get_user_context,
         get_top_posts, get_low_engagement_posts, get_recent_comments,
         get_regen_feedback, get_recent_talk_transcripts, get_retired_topics,
+        get_content_pillars,
     )
     from digest_reader import get_digest_context
 
     sections = []
+
+    # === CONTENT PILLARS — strategy filter at absolute top.
+    # Robert's positioning: he wants to OWN 2-3 topics in his audience's heads.
+    # Posts outside these pillars are off-strategy and not worth posting at all.
+    # If the current material doesn't fit any pillar, the model should refuse
+    # or pick a different angle that does.
+    try:
+        pillars = await get_content_pillars(pool)
+        if pillars:
+            primary = [p for p in pillars if p["priority"] == 1]
+            secondary = [p for p in pillars if p["priority"] == 2]
+            deprio = [p for p in pillars if p["priority"] >= 3]
+            blocks = []
+            if primary:
+                blocks.append("PRIMARY PILLARS (write here first):\n" + "\n".join(
+                    f"  • {p['title']} — {p['description'] or ''}"
+                    + (f"\n    keywords: {p['keywords']}" if p['keywords'] else "")
+                    for p in primary
+                ))
+            if secondary:
+                blocks.append("SECONDARY (acceptable if primary doesn't fit):\n" + "\n".join(
+                    f"  • {p['title']}" for p in secondary
+                ))
+            if deprio:
+                blocks.append("DEPRIORITIZE (avoid unless explicitly asked):\n" + "\n".join(
+                    f"  • {p['title']}" for p in deprio
+                ))
+            sections.append(
+                "=== CONTENT PILLARS — Robert's positioning strategy. The post "
+                "MUST fit one of these pillars. If the current material doesn't "
+                "fit, find an angle that does or write a short observation that "
+                "advances one of the pillars. ===\n" + "\n\n".join(blocks)
+            )
+    except Exception as e:
+        logger.warning(f"Content pillars load failed: {e}")
 
     # === RETIRED TOPICS — absolute front. These are projects Robert explicitly
     # marked as "stop mentioning". Even if they appear in life context or in
