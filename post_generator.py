@@ -561,6 +561,114 @@ Conversation:
 Now write the post."""
 
 
+_RESEARCH_PROMPT = """You are doing background research for a LinkedIn post Robert will publish. Use web search to find 4-6 concrete data points, recent articles, or authoritative sources on the topic.
+
+Topic: {topic}
+
+What I need from you:
+- 4-6 specific findings (numbers, quotes from authoritative sources, recent industry events from the last 12 months, technical patterns documented elsewhere)
+- For each: a one-sentence summary + the source name + the year/date if known
+- Skip generic claims ("AI is transforming X"). I need SPECIFIC, citable facts.
+
+Return ONLY a JSON array, no markdown:
+[
+  {{"finding": "...", "source": "...", "year": "2025", "url_hint": "domain.com"}},
+  ...
+]"""
+
+
+_RESEARCH_DRAFT_PROMPT = """You're writing a LinkedIn post for Robert. Use the research below to make the post EXPERT and CITABLE — not just opinion, but grounded in real recent data.
+
+CRITICAL:
+- Reference 2-3 of the research findings naturally in the body (don't paste citations as a list; weave them in like an essay)
+- Robert's own production experience is the spine of the post; research is the support
+- Stay within Robert's content pillars (see above in context)
+- Keep his voice: specific, blunt, real numbers, no motivational hype
+- Length: 200-280 words
+
+Research findings:
+{research}
+
+Topic: {topic}
+
+Now write the post."""
+
+
+async def research_and_draft(topic: str, pool=None) -> dict:
+    """Two-phase: web-search Claude collects citable findings, then a second
+    Claude call drafts an expert post grounded in those findings + Robert's
+    pillars + life context."""
+    learning = await build_learning_context(pool) if pool else ""
+
+    # Phase 1: research with web search
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 2000,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [
+                    {"role": "user", "content": _RESEARCH_PROMPT.format(topic=topic)}
+                ],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text_parts = [b["text"] for b in data["content"] if b.get("type") == "text"]
+        raw = "\n".join(text_parts).strip()
+
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    start = cleaned.find("[")
+    end = cleaned.rfind("]") + 1
+    try:
+        findings = json.loads(cleaned[start:end])
+    except Exception as e:
+        logger.error(f"Research parse failed: {e}; raw: {raw[:400]}")
+        findings = []
+
+    if not findings:
+        # Fall back to a normal /write if research came back empty
+        return await generate_post_from_topic(topic, pool=pool)
+
+    research_block = "\n".join(
+        f"- {f.get('finding', '')} ({f.get('source', '?')} {f.get('year', '')})"
+        for f in findings[:6]
+    )
+
+    # Phase 2: draft expert post grounded in research + pillars
+    async with httpx.AsyncClient(timeout=90) as client:
+        draft_data = await claude_request(client, {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1500,
+            "system": SYSTEM_PROMPT,
+            "messages": [
+                {"role": "user",
+                 "content": ((f"{learning}\n\n" if learning else "")
+                              + _RESEARCH_DRAFT_PROMPT.format(
+                                  research=research_block, topic=topic
+                              ))}
+            ],
+        })
+        post_text = clean_post_text(draft_data["content"][0]["text"])
+        await asyncio.sleep(2)
+        fact_check = await fact_check_post(client, post_text)
+        await asyncio.sleep(2)
+        visual = await generate_visual(client, post_text)
+
+    return {
+        "post_text": post_text,
+        "meme": visual,
+        "fact_check": fact_check,
+        "research_findings": findings,
+    }
+
+
 _SUGGEST_PROMPT = """You're helping Robert pick what to write a LinkedIn post about TODAY.
 
 The context above contains his current life, the topics he ALREADY posted on (TOPIC LOCK), retired projects (DO NOT MENTION), reader comments, etc.

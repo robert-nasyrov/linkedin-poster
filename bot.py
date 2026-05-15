@@ -1421,6 +1421,49 @@ async def cmd_cancel(message: Message):
     await message.answer("Nothing to cancel.")
 
 
+@router.message(Command("research"))
+async def cmd_research(message: Message):
+    """Web-research a topic, then draft an expert post grounded in real
+    citable findings + Robert's pillars. Slower than /write (2 Claude
+    calls + web search) but produces post worth Robert's reputation."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    topic = (message.text or "").replace("/research", "", 1).strip()
+    if not topic:
+        await message.answer(
+            "Usage: /research <topic>\n"
+            "Example: /research production AI failure modes 2025\n"
+            "Bot will web-search for findings, then draft a post grounded in them."
+        )
+        return
+
+    await message.answer(
+        f"🔬 Researching '{topic[:80]}'...\n_(this takes 20-40s — web search + draft)_",
+        parse_mode="Markdown",
+    )
+    try:
+        from post_generator import research_and_draft
+        generated = await research_and_draft(topic, pool=pool)
+    except Exception as e:
+        logger.error(f"/research error: {e}")
+        await message.answer(f"❌ {e}")
+        return
+
+    post_id = await save_post(pool, [], generated["post_text"], generated.get("meme"))
+
+    # Surface the research findings before the draft for transparency
+    findings = generated.get("research_findings") or []
+    if findings:
+        lines = ["📚 *Research findings used:*\n"]
+        for i, f in enumerate(findings[:6], 1):
+            src = f.get("source", "?")
+            year = f.get("year", "")
+            lines.append(f"{i}. {f.get('finding', '')[:200]}\n   _— {src} {year}_")
+        await message.answer("\n\n".join(lines), parse_mode="Markdown")
+
+    await send_approval(message.chat.id, post_id, generated)
+
+
 @router.message(Command("genvars"))
 async def cmd_genvars(message: Message):
     """Generate 3 distinct variants in different energy types so Robert can
