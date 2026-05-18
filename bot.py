@@ -81,6 +81,10 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💬 Talk it out", callback_data="menu:talk"),
         ],
         [
+            InlineKeyboardButton(text="🔬 Research post", callback_data="menu:research"),
+            InlineKeyboardButton(text="🎨 Carousel", callback_data="menu:carousel"),
+        ],
+        [
             InlineKeyboardButton(text="🎲 Auto-generate", callback_data="menu:generate"),
             InlineKeyboardButton(text="🔀 3 variants", callback_data="menu:genvars"),
         ],
@@ -89,11 +93,14 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📝 Add context", callback_data="menu:context"),
         ],
         [
+            InlineKeyboardButton(text="📌 Pillars", callback_data="menu:pillars"),
             InlineKeyboardButton(text="🚫 Retire topic", callback_data="menu:retire"),
-            InlineKeyboardButton(text="📋 Show retired", callback_data="menu:retired_list"),
         ],
         [
+            InlineKeyboardButton(text="📋 Show retired", callback_data="menu:retired_list"),
             InlineKeyboardButton(text="📊 Stats", callback_data="menu:stats"),
+        ],
+        [
             InlineKeyboardButton(text="🔌 Status", callback_data="menu:status"),
         ],
     ])
@@ -502,6 +509,42 @@ async def cb_menu_status(callback: CallbackQuery):
     else:
         lines.append("Threads: ❌ /threads")
     await callback.message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "menu:research")
+async def cb_menu_research(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    menu_input_states[callback.from_user.id] = "research"
+    await callback.message.answer(
+        "🔬 Send the topic to research.\n"
+        "I'll web-search for 4-6 citable findings, then draft a post grounded in them.\n"
+        "Example: 'production AI failure modes 2025'.\n"
+        "/cancel to drop."
+    )
+
+
+@router.callback_query(F.data == "menu:carousel")
+async def cb_menu_carousel(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    menu_input_states[callback.from_user.id] = "carousel"
+    await callback.message.answer(
+        "🎨 Send the topic for the 5-slide carousel.\n"
+        "Structure: hook → approach → mistake → result → lesson.\n"
+        "Example: 'why production AI bots fail silently'.\n"
+        "/cancel to drop."
+    )
+
+
+@router.callback_query(F.data == "menu:pillars")
+async def cb_menu_pillars(callback: CallbackQuery):
+    if callback.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    await callback.answer()
+    await cmd_pillars(callback.message)
 
 
 @router.callback_query(F.data == "menu:back")
@@ -1419,6 +1462,69 @@ async def cmd_cancel(message: Message):
         await message.answer("🚫 Talk session cancelled.")
         return
     await message.answer("Nothing to cancel.")
+
+
+@router.message(Command("carousel"))
+async def cmd_carousel(message: Message):
+    """Generate a 5-slide LinkedIn carousel: hook → approach → mistake →
+    result → lesson. Output is structured text + visual hints per slide;
+    Robert renders in Figma/Canva or copies into LinkedIn document post."""
+    if message.from_user.id != TELEGRAM_ADMIN_ID:
+        return
+    topic = (message.text or "").replace("/carousel", "", 1).strip()
+    if not topic:
+        await message.answer(
+            "Usage: /carousel <topic>\n"
+            "Example: /carousel why production AI bots fail silently\n"
+            "Returns 5 slides + caption + visual hints — ready to paste into Canva/Figma."
+        )
+        return
+
+    await message.answer(
+        f"🎨 Drafting 5-slide carousel on '{topic[:80]}'..."
+    )
+    try:
+        from post_generator import carousel_draft
+        data = await carousel_draft(topic, pool=pool)
+    except Exception as e:
+        logger.error(f"/carousel error: {e}")
+        await message.answer(f"❌ {e}")
+        return
+
+    slides = data.get("slides") or []
+    if not slides:
+        await message.answer("❌ Couldn't structure a carousel for this topic.")
+        return
+
+    # Send the carousel structure as one well-formatted message per slide
+    title = data.get("title", topic)
+    await message.answer(f"🎨 *Carousel:* {title}", parse_mode="Markdown")
+    for s in slides:
+        label = s.get("label", "")
+        num = s.get("slide", "?")
+        text = s.get("text", "")
+        visual = s.get("visual_hint", "")
+        await message.answer(
+            f"*Slide {num} — {label}*\n\n{text}\n\n"
+            f"_🎨 Visual: {visual}_",
+            parse_mode="Markdown",
+        )
+    caption = data.get("caption", "")
+    if caption:
+        await message.answer(f"📝 *LinkedIn caption:*\n\n{caption}", parse_mode="Markdown")
+
+    # Also save as a draft for the standard approval flow (in case Robert
+    # wants to post it as a single text post instead of a carousel)
+    flat_text = "\n\n".join(
+        f"[{s.get('label', '')}]\n{s.get('text', '')}" for s in slides
+    )
+    if caption:
+        flat_text = caption + "\n\n---\n\n" + flat_text
+    post_id = await save_post(pool, [], flat_text, None)
+    await message.answer(
+        f"💾 Also saved as draft #{post_id} (flat text). "
+        f"Tap /repost {post_id} to get approval card if you want to ship as text post."
+    )
 
 
 @router.message(Command("research"))
@@ -2547,6 +2653,73 @@ async def handle_free_text(message: Message):
                 f"🚫 '{kw}' retired. Bot will stop mentioning it in new posts."
                 + (f"\nNote: {note}" if note else "")
             )
+            return
+
+        if mode == "research":
+            await message.answer(
+                f"🔬 Researching '{text[:80]}'..."
+            )
+            try:
+                from post_generator import research_and_draft
+                generated = await research_and_draft(text, pool=pool)
+                post_id = await save_post(
+                    pool, [], generated["post_text"], generated.get("meme")
+                )
+                findings = generated.get("research_findings") or []
+                if findings:
+                    lines = ["📚 *Research findings used:*\n"]
+                    for i, f in enumerate(findings[:6], 1):
+                        src = f.get("source", "?")
+                        year = f.get("year", "")
+                        lines.append(
+                            f"{i}. {f.get('finding', '')[:200]}\n   _— {src} {year}_"
+                        )
+                    await message.answer(
+                        "\n\n".join(lines), parse_mode="Markdown"
+                    )
+                await send_approval(message.chat.id, post_id, generated)
+            except Exception as e:
+                logger.error(f"menu:research input error: {e}")
+                await message.answer(f"❌ {e}")
+            return
+
+        if mode == "carousel":
+            await message.answer(f"🎨 Drafting 5-slide carousel on '{text[:80]}'...")
+            try:
+                from post_generator import carousel_draft
+                data = await carousel_draft(text, pool=pool)
+                slides = data.get("slides") or []
+                if not slides:
+                    await message.answer("❌ Couldn't structure a carousel.")
+                    return
+                title = data.get("title", text)
+                await message.answer(f"🎨 *Carousel:* {title}", parse_mode="Markdown")
+                for s in slides:
+                    await message.answer(
+                        f"*Slide {s.get('slide', '?')} — {s.get('label', '')}*\n\n"
+                        f"{s.get('text', '')}\n\n"
+                        f"_🎨 Visual: {s.get('visual_hint', '')}_",
+                        parse_mode="Markdown",
+                    )
+                caption = data.get("caption", "")
+                if caption:
+                    await message.answer(
+                        f"📝 *LinkedIn caption:*\n\n{caption}",
+                        parse_mode="Markdown",
+                    )
+                flat_text = "\n\n".join(
+                    f"[{s.get('label', '')}]\n{s.get('text', '')}" for s in slides
+                )
+                if caption:
+                    flat_text = caption + "\n\n---\n\n" + flat_text
+                post_id = await save_post(pool, [], flat_text, None)
+                await message.answer(
+                    f"💾 Also saved as draft #{post_id} (flat text). "
+                    f"/repost {post_id} for approval card."
+                )
+            except Exception as e:
+                logger.error(f"menu:carousel input error: {e}")
+                await message.answer(f"❌ {e}")
             return
 
         if mode == "pillar_add":

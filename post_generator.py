@@ -669,6 +669,61 @@ async def research_and_draft(topic: str, pool=None) -> dict:
     }
 
 
+_CAROUSEL_PROMPT = """You are designing a LinkedIn carousel (PDF/document-style post) for Robert. Carousels get 2-3x more impressions than text posts when done right.
+
+Structure: 5 slides, each 30-80 words. The audience is technical (AI engineers, founders, recruiters). Each slide stands alone visually.
+
+Required structure:
+- Slide 1: HOOK / PROBLEM — the bold claim or specific problem. Must make the reader stop scrolling.
+- Slide 2: APPROACH — what you did or what to do (not theory; concrete approach).
+- Slide 3: MISTAKE / WHAT BROKE — the wrong turn you took or what others miss. Vulnerability + specificity.
+- Slide 4: RESULT — concrete outcome with numbers if possible.
+- Slide 5: LESSON / TAKEAWAY — the one thing you'd tell your past self.
+
+Stay in Robert's voice: specific, blunt, real numbers (only ones from the context), no motivational hype.
+Stay within Robert's content pillars (above).
+
+Topic: {topic}
+
+Return ONLY a JSON object:
+{{
+  "title": "5-10 word title for the carousel",
+  "slides": [
+    {{"slide": 1, "label": "HOOK", "text": "...", "visual_hint": "one-line description of what should be on this slide visually"}},
+    {{"slide": 2, "label": "APPROACH", "text": "...", "visual_hint": "..."}},
+    {{"slide": 3, "label": "MISTAKE", "text": "...", "visual_hint": "..."}},
+    {{"slide": 4, "label": "RESULT", "text": "...", "visual_hint": "..."}},
+    {{"slide": 5, "label": "LESSON", "text": "...", "visual_hint": "..."}}
+  ],
+  "caption": "short LinkedIn caption (60-120 words) that accompanies the carousel when posting — should tease the content without giving away the lesson"
+}}"""
+
+
+async def carousel_draft(topic: str, pool=None) -> dict:
+    """Generate a 5-slide carousel structure (title + slides[] + caption)."""
+    learning = await build_learning_context(pool) if pool else ""
+    async with httpx.AsyncClient(timeout=90) as client:
+        data = await claude_request(client, {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 2500,
+            "system": SYSTEM_PROMPT,
+            "messages": [
+                {"role": "user",
+                 "content": ((f"{learning}\n\n" if learning else "")
+                              + _CAROUSEL_PROMPT.format(topic=topic))}
+            ],
+        })
+    raw = data["content"][0]["text"].strip()
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}") + 1
+    try:
+        return json.loads(cleaned[start:end])
+    except Exception as e:
+        logger.error(f"Carousel parse failed: {e}; raw: {raw[:500]}")
+        return {"title": topic, "slides": [], "caption": ""}
+
+
 _SUGGEST_PROMPT = """You're helping Robert pick what to write a LinkedIn post about TODAY.
 
 The context above contains his current life, the topics he ALREADY posted on (TOPIC LOCK), retired projects (DO NOT MENTION), reader comments, etc.
